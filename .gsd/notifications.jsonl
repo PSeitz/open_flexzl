@@ -1,0 +1,2 @@
+{"id":"c31148d8-9026-4285-94e0-bacd1102b6f4","ts":"2026-05-03T14:57:12.264Z","severity":"info","message":"Project already initialized. Use `/gsd auto` to continue or `/gsd discuss` to start a new milestone.","source":"notify","read":false}
+{"id":"dd8f521e-c594-4d99-81d1-b25f52058ce5","ts":"2026-05-03T14:58:06.840Z","severity":"info","message":"Project detected:\n  rust project\n  Project files: Cargo.toml\n  Verification: cargo test, cargo clippy","source":"notify","read":false}
