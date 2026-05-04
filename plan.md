@@ -1,6 +1,6 @@
 # open_flexzl plan
 
-Status: planning / handoff document. 
+Status: v1 checklist approved; initial implementation landed.
 
 ## Current handoff summary
 
@@ -8,8 +8,8 @@ A new session should be able to resume from this document alone.
 
 Important current consensus:
 
-- Do not implement yet unless the implementation approval checklist near the end is explicitly approved.
-- Existing Rust code under `open_flexzl/src/` was scratch/prototype, not approved design, and has now been removed/replaced with tiny `NotImplemented` stubs. Do not try to recover or incrementally patch the old implementation; implement fresh from this plan after approval.
+- The implementation approval checklist near the end is now approved.
+- Existing scratch/prototype code under `open_flexzl/src/` was discarded; the crate now has a fresh v1 implementation based on this plan. Do not recover the old prototype.
 - The target remains a Rust-native `u32` FieldLZ compressor, not OpenZL frame compatibility.
 - We approved using the same broad semantics as OpenZL with a simpler native chunk-local decoding-map encoding.
 - The frame should use OpenZL-like stream type values and standard transform IDs where they line up, e.g. `22 = zstd` and `24 = field_lz`.
@@ -18,17 +18,16 @@ Important current consensus:
 - A codec/transform interface is central. Side-stream routing should be represented as transform chains in the chunk map.
 - First implementation can support only zstd and FieldLZ transforms, plus direct raw stored streams if the small-stream route is approved for milestone 1.
 - This zstd/bootstrap route is not a frame-format limitation; reference side-stream routing is tracked for later parity, but FSE/Huffman/bitpack are not needed for the first version because zstd side streams are good enough initially.
-- Target zstd behavior is modern OpenZL magicless zstd frames with content size present. Before implementation, verify Rust zstd magicless support. If the high-level crate does not expose it, add lower-level support and leave a TODO/reference note rather than silently changing the spec.
-- Direct small-stream store is tracked separately from store-on-expansion. OpenZL’s small-stream threshold is strict `< 10` bytes.
+- Target zstd behavior is modern OpenZL magicless zstd frames with content size present. Rust support was verified with `zstd = { version = "0.13", features = ["experimental"] }`; the implementation uses high-level magicless encode/decode settings plus `ZSTD_getFrameHeader_advanced(..., ZSTD_f_zstd1_magicless)` for content-size validation.
+- Direct small-stream store is included in milestone 1, separately from store-on-expansion. OpenZL’s small-stream threshold is strict `< 10` bytes.
 - Quantize is tracked as a post-v1 reference-parity candidate if raw zstd side streams prove to be a ratio bottleneck: it is reversible `value -> code + raw extra bits`, not dictionary coding.
 
 Suggested next-session order:
 
 1. Re-read this plan and the implementation approval checklist.
-2. Verify Rust zstd magicless encode/decode support (`zstd-safe` or equivalent) and update the zstd transform contract only if necessary.
-3. Confirm direct small-stream store as milestone 1, or explicitly defer it.
-4. Approve or revise the remaining unchecked checklist items, including benchmark tooling (`binggan`, not Criterion).
-5. Only then replace/discard scratch implementation code and implement against this plan.
+2. Continue Phase 3 hardening: more corrupt/map validation tests, property tests, and binary golden fixtures.
+3. Add Phase 4 `binggan` benchmarks and zstd-on-raw comparisons.
+4. Benchmark the v1 parser before adding repeated-offset emission or non-zstd side-stream codecs.
 
 ## Draft open-question recommendations
 
@@ -869,24 +868,24 @@ ml_code     = 3
 
 ## Implementation approval checklist
 
-Before writing implementation code, explicitly approve or revise this checklist:
+Approved checklist:
 
-- [ ] Wire constants are fixed as listed in the v1 spec, including OpenZL type and transform ID values.
-- [ ] Canonical unsigned LEBU64 is accepted as the varint format.
+- [x] Wire constants are fixed as listed in the v1 spec, including OpenZL type and transform ID values.
+- [x] Canonical unsigned LEBU64 is accepted as the varint format.
 - [x] Chunks use the simple native decoding-map structure with OpenZL-like transform IDs and OpenZL-derived runtime limits, rather than exact OpenZL frame-map encoding.
 - [x] Top-level frame stores final output metadata: OpenZL type, element width, and element count.
 - [x] The first implementation must support transform IDs 22 (`zstd`) and 24 (`field_lz`); later transform IDs can be added without changing the outer map.
-- [ ] Zstd transform behavior is finalized after checking Rust zstd magicless support; target is modern OpenZL magicless payloads with content size present and output element width in the private header. If the high-level Rust API lacks magicless support, add lower-level support and leave a TODO/reference note.
-- [ ] Decide whether direct small-stream store (`byte_size < 10`) is milestone 1 or milestone 2.
-- [ ] Empty input uses `chunk_count = 0`; non-empty chunks must have at least one element.
-- [ ] Decoder strictly validates reserved token bits, stream length multiples, stream consumption, offsets, chunk totals, output length, map consistency, and trailing bytes.
-- [ ] V1 match-finder contract is acceptable: `u32`-specialized, lz4_flex-inspired linear parser, pair hash, minimum emitted match length 2, explicit offsets initially, with repeated-offset emission added after benchmarks.
-- [ ] Benchmarks use `binggan`, not Criterion.
-- [ ] FSE/Huffman/bitpack side-stream codecs are deferred beyond v1; zstd side streams are sufficient initially.
+- [x] Zstd transform behavior is finalized after checking Rust zstd magicless support; target is modern OpenZL magicless payloads with content size present and output element width in the private header. High-level magicless settings are available with the `experimental` feature; content-size validation uses `ZSTD_getFrameHeader_advanced`.
+- [x] Direct small-stream store (`byte_size < 10`) is milestone 1.
+- [x] Empty input uses `chunk_count = 0`; non-empty chunks must have at least one element.
+- [x] Decoder strictly validates reserved token bits, stream length multiples, stream consumption, offsets, chunk totals, output length, map consistency, and trailing bytes.
+- [x] V1 match-finder contract is acceptable: `u32`-specialized, lz4_flex-inspired linear parser, pair hash, minimum emitted match length 2, explicit offsets initially, with repeated-offset emission added after benchmarks.
+- [x] Benchmarks use `binggan`, not Criterion.
+- [x] FSE/Huffman/bitpack side-stream codecs are deferred beyond v1; zstd side streams are sufficient initially.
 - [x] Reference side-stream routing is tracked but implemented incrementally through the transform interface.
 - [x] Byte-transposed literals remain deferred to the reference literal route milestone.
-- [ ] Full binary golden fixtures will be generated and checked in during implementation.
+- [ ] Full binary golden fixtures still need to be generated and checked in during hardening.
 
 ## Next step
 
-For a new session: start at the handoff summary at the top, then review this checklist. The main unresolved blocker before implementation is verifying magicless zstd support in Rust and approving/revising the unchecked checklist items. Do not implement until this spec is approved.
+Continue with hardening: expand corrupt-frame/map tests, add checked-in binary golden fixtures, add property tests, then add `binggan` benchmarks before parser or side-stream-codec optimization.

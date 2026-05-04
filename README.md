@@ -5,12 +5,11 @@ intentionally does **not** target OpenZL frame compatibility.
 
 ## Status
 
-Planning / implementation reset.
+Initial v1 implementation.
 
-The previous Rust prototype was removed because it diverged from the current
-plan. The public API shape is reserved, but the functions currently return
-`Error::NotImplemented` until `plan.md` is explicitly approved for
-implementation.
+The crate exposes `compress_u32()` / `decompress_u32()` for a native `OFZL` v1
+frame with chunk-local transform maps, FieldLZ side streams, direct tiny-stream
+store, and magicless zstd side-stream transforms.
 
 ```rust
 let compressed = open_flexzl::compress_u32(&values)?;

@@ -7,3 +7,4 @@ description = "Rust-native fixed-width numeric compression inspired by OpenZL, i
 
 [dependencies]
 thiserror = "2"
+zstd = { version = "0.13", features = ["experimental"] }
