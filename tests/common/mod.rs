@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod datasets;
+
 pub const MAGIC: &[u8; 4] = b"OFZL";
 pub const VERSION_V1: u8 = 1;
 pub const KIND_U32_FIELD_LZ: u8 = 1;

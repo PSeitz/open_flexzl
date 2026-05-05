@@ -13,10 +13,17 @@
 use binggan::{black_box, BenchRunner};
 use open_flexzl::{compress_u32, decompress_u32};
 
+#[path = "../tests/common/datasets.rs"]
+mod real_world;
+
 const ZSTD_LEVEL: i32 = 6;
 
 fn main() {
-    let datasets = build_datasets();
+    let mut datasets = build_synthetic_datasets();
+    for ds in real_world::load_representative_set() {
+        datasets.push((ds.label, ds.values));
+    }
+
     let mut runner = BenchRunner::new();
 
     for (name, data) in &datasets {
@@ -67,7 +74,7 @@ fn main() {
 
 const ELEMENTS_PER_DATASET: usize = 1 << 16; // 64 KiB elements = 256 KiB raw
 
-fn build_datasets() -> Vec<(&'static str, Vec<u32>)> {
+fn build_synthetic_datasets() -> Vec<(&'static str, Vec<u32>)> {
     let n = ELEMENTS_PER_DATASET;
 
     // 32-element block repeated to fill the dataset.
