@@ -96,13 +96,7 @@ fn rejects_chunk_total_above_frame_total() {
     // Frame says num_elements=1, single chunk has 2.
     let chunk = baseline_field_lz_chunk(
         2,
-        [
-            vec![0u8; 8],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ],
+        [vec![0u8; 8], Vec::new(), Vec::new(), Vec::new(), Vec::new()],
     );
     let frame = build_frame(1, &[chunk]);
     assert!(decompress_u32(&frame).is_err());

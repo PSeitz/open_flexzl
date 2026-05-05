@@ -30,7 +30,8 @@ const ONE_LITERAL_FRAME: &[u8] = &[
     0x01, 0x00, // stored 2 (offsets): id=2, len=0
     0x02, 0x00, // stored 3 (extra_ll): id=3, len=0
     0x03, 0x00, // stored 4 (extra_ml): id=4, len=0
-    0x04, 0x00, // transform: id=24 (FieldLZ), 5 inputs [0..=4], 1 output [5], private=varint(1)
+    0x04,
+    0x00, // transform: id=24 (FieldLZ), 5 inputs [0..=4], 1 output [5], private=varint(1)
     0x18, 0x05, 0x00, 0x01, 0x02, 0x03, 0x04, 0x01, 0x05, 0x01, 0x01,
 ];
 

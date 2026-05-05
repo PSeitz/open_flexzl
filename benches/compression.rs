@@ -1,14 +1,13 @@
-//! `binggan` benchmark harness for `open_flexzl` against zstd-on-raw bytes.
+//! `binggan` benchmark harness for `open_flexzl` against zstd-on-raw bytes
+//! and the upstream OpenZL library (via `rust-openzl`).
 //!
-//! For each synthetic dataset we report:
-//!
-//! - compression throughput (input_size = raw u32 bytes)
-//! - decompression throughput (input_size = original raw u32 bytes, the
-//!   conventional measure for decompression)
-//! - the compressed size each function produced (printed as the OutputValue)
-//!
-//! Compression ratios are also printed once per dataset before the benches run,
-//! so a single `cargo bench` invocation reports throughput + ratio together.
+//! Compression and decompression are run as two separate phases over the full
+//! dataset list — easier to read than alternating compress/decompress per
+//! dataset, and the runner's section name (`compression` / `decompression`)
+//! makes the split obvious in the output. The OutputValue column shows the
+//! compressed size for compress benches and the decoded byte count for
+//! decompress benches, so per-dataset ratios are visible without additional
+//! prints.
 
 use binggan::{black_box, BenchRunner};
 use open_flexzl::{compress_u32, decompress_u32};
@@ -26,67 +25,81 @@ fn openzl_decompress(frame: &[u8]) -> Vec<u32> {
     rust_openzl::decompress_numeric::<u32>(frame).expect("openzl decode")
 }
 
+struct Prepared {
+    name: &'static str,
+    data: Vec<u32>,
+    raw_bytes: Vec<u8>,
+    raw_size: usize,
+    ofzl_frame: Vec<u8>,
+    zstd_frame: Vec<u8>,
+    openzl_frame: Vec<u8>,
+}
+
 fn main() {
     let mut datasets = build_synthetic_datasets();
     for ds in real_world::load_representative_set() {
         datasets.push((ds.label, ds.values));
     }
 
+    let prepared: Vec<Prepared> = datasets
+        .into_iter()
+        .map(|(name, data)| {
+            let raw_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let raw_size = raw_bytes.len();
+            let ofzl_frame = compress_u32(&data).expect("ofzl encode");
+            let zstd_frame = zstd::bulk::compress(&raw_bytes, ZSTD_LEVEL).expect("zstd encode");
+            let openzl_frame = openzl_compress(&data);
+            Prepared {
+                name,
+                data,
+                raw_bytes,
+                raw_size,
+                ofzl_frame,
+                zstd_frame,
+                openzl_frame,
+            }
+        })
+        .collect();
+
     let mut runner = BenchRunner::new();
 
-    for (name, data) in &datasets {
-        let raw_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let raw_size = raw_bytes.len();
+    runner.set_name("compression");
+    for p in &prepared {
+        let mut group = runner.new_group();
+        group.set_name(p.name);
+        group.set_input_size(p.raw_size);
+        group.register_with_input("ofzl", &p.data, |input| {
+            black_box(compress_u32(input).expect("ofzl encode")).len() as u64
+        });
+        group.register_with_input("zstd_on_raw", &p.raw_bytes, |bytes| {
+            black_box(zstd::bulk::compress(bytes, ZSTD_LEVEL).expect("zstd encode")).len() as u64
+        });
+        group.register_with_input("openzl", &p.data, |input| {
+            black_box(openzl_compress(input)).len() as u64
+        });
+        group.run();
+    }
 
-        let ofzl_frame = compress_u32(data).expect("ofzl encode");
-        let zstd_frame = zstd::bulk::compress(&raw_bytes, ZSTD_LEVEL).expect("zstd encode");
-        let openzl_frame = openzl_compress(data);
-
-        eprintln!(
-            "[{name}] raw={raw_size}B  ofzl={}B ({:.2}x)  zstd_on_raw={}B ({:.2}x)  openzl={}B ({:.2}x)",
-            ofzl_frame.len(),
-            raw_size as f64 / ofzl_frame.len() as f64,
-            zstd_frame.len(),
-            raw_size as f64 / zstd_frame.len() as f64,
-            openzl_frame.len(),
-            raw_size as f64 / openzl_frame.len() as f64,
-        );
-
-        {
-            let mut group = runner.new_group();
-            group.set_name(format!("{name} compress"));
-            group.set_input_size(raw_size);
-            group.register_with_input("ofzl", data, |input| {
-                black_box(compress_u32(input).expect("ofzl encode")).len() as u64
-            });
-            group.register_with_input("zstd_on_raw", &raw_bytes, |bytes| {
-                black_box(zstd::bulk::compress(bytes, ZSTD_LEVEL).expect("zstd encode")).len() as u64
-            });
-            group.register_with_input("openzl", data, |input| {
-                black_box(openzl_compress(input)).len() as u64
-            });
-            group.run();
-        }
-
-        {
-            let mut group = runner.new_group();
-            group.set_name(format!("{name} decompress"));
-            group.set_input_size(raw_size);
-            group.register_with_input("ofzl", &ofzl_frame, |frame| {
-                // Return decoded byte count (not element count) so the OutputValue
-                // column is comparable to the zstd-on-raw bench below.
-                let decoded = black_box(decompress_u32(frame).expect("ofzl decode"));
-                (decoded.len() * std::mem::size_of::<u32>()) as u64
-            });
-            group.register_with_input("zstd_on_raw", &zstd_frame, |frame| {
-                black_box(zstd::bulk::decompress(frame, raw_size).expect("zstd decode")).len() as u64
-            });
-            group.register_with_input("openzl", &openzl_frame, |frame| {
-                let decoded = black_box(openzl_decompress(frame));
-                (decoded.len() * std::mem::size_of::<u32>()) as u64
-            });
-            group.run();
-        }
+    runner.set_name("decompression");
+    for p in &prepared {
+        let raw_size = p.raw_size;
+        let mut group = runner.new_group();
+        group.set_name(p.name);
+        group.set_input_size(p.raw_size);
+        group.register_with_input("ofzl", &p.ofzl_frame, |frame| {
+            // Return decoded byte count (not element count) so the OutputValue
+            // column is comparable to the other benches in this group.
+            let decoded = black_box(decompress_u32(frame).expect("ofzl decode"));
+            (decoded.len() * std::mem::size_of::<u32>()) as u64
+        });
+        group.register_with_input("zstd_on_raw", &p.zstd_frame, |frame| {
+            black_box(zstd::bulk::decompress(frame, raw_size).expect("zstd decode")).len() as u64
+        });
+        group.register_with_input("openzl", &p.openzl_frame, |frame| {
+            let decoded = black_box(openzl_decompress(frame));
+            (decoded.len() * std::mem::size_of::<u32>()) as u64
+        });
+        group.run();
     }
 }
 
