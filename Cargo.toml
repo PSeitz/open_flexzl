@@ -12,6 +12,7 @@ zstd = { version = "0.13", features = ["experimental"] }
 [dev-dependencies]
 proptest = "1"
 binggan = "0.16"
+rust-openzl = "0.1"
 
 [[bench]]
 name = "compression"

@@ -304,13 +304,32 @@ fn emit_sequence(
 }
 
 fn insert_matched_range(input: &[u32], start: usize, end: usize, table: &mut HashTable) {
-    if end.saturating_sub(start) < 2 {
-        return;
-    }
-    let last = end.saturating_sub(1).min(input.len().saturating_sub(1));
-    for pos in start..last {
-        let hash = hash_pair(input[pos], input[pos + 1], table.mask());
-        table.set(hash, (pos + 1) as u32);
+    // Mirror OpenZL's fast parser by inserting only a handful of hash
+    // entries per match instead of every position in the range. For short
+    // matches we still cover every interior position (cheap, useful);
+    // beyond that we fall back to start+1 / end-1 plus periodic mid-points
+    // so cyclic data still finds future matches after a phase shift.
+    let limit = input.len().saturating_sub(1);
+    let mut put = |pos: usize| {
+        if pos > start && pos < end && pos < limit {
+            let hash = hash_pair(input[pos], input[pos + 1], table.mask());
+            table.set(hash, (pos + 1) as u32);
+        }
+    };
+
+    let span = end.saturating_sub(start);
+    if span < 16 {
+        for pos in (start + 1)..end.saturating_sub(1) {
+            put(pos);
+        }
+    } else {
+        put(start + 1);
+        let mut pos = start + 8;
+        while pos + 1 < end {
+            put(pos);
+            pos += 8;
+        }
+        put(end.saturating_sub(1));
     }
 }
 

@@ -18,6 +18,14 @@ mod real_world;
 
 const ZSTD_LEVEL: i32 = 6;
 
+fn openzl_compress(data: &[u32]) -> Vec<u8> {
+    rust_openzl::compress_numeric(data).expect("openzl encode")
+}
+
+fn openzl_decompress(frame: &[u8]) -> Vec<u32> {
+    rust_openzl::decompress_numeric::<u32>(frame).expect("openzl decode")
+}
+
 fn main() {
     let mut datasets = build_synthetic_datasets();
     for ds in real_world::load_representative_set() {
@@ -32,13 +40,16 @@ fn main() {
 
         let ofzl_frame = compress_u32(data).expect("ofzl encode");
         let zstd_frame = zstd::bulk::compress(&raw_bytes, ZSTD_LEVEL).expect("zstd encode");
+        let openzl_frame = openzl_compress(data);
 
         eprintln!(
-            "[{name}] raw={raw_size}B  ofzl={}B ({:.2}x)  zstd_on_raw={}B ({:.2}x)",
+            "[{name}] raw={raw_size}B  ofzl={}B ({:.2}x)  zstd_on_raw={}B ({:.2}x)  openzl={}B ({:.2}x)",
             ofzl_frame.len(),
             raw_size as f64 / ofzl_frame.len() as f64,
             zstd_frame.len(),
             raw_size as f64 / zstd_frame.len() as f64,
+            openzl_frame.len(),
+            raw_size as f64 / openzl_frame.len() as f64,
         );
 
         {
@@ -50,6 +61,9 @@ fn main() {
             });
             group.register_with_input("zstd_on_raw", &raw_bytes, |bytes| {
                 black_box(zstd::bulk::compress(bytes, ZSTD_LEVEL).expect("zstd encode")).len() as u64
+            });
+            group.register_with_input("openzl", data, |input| {
+                black_box(openzl_compress(input)).len() as u64
             });
             group.run();
         }
@@ -66,6 +80,10 @@ fn main() {
             });
             group.register_with_input("zstd_on_raw", &zstd_frame, |frame| {
                 black_box(zstd::bulk::decompress(frame, raw_size).expect("zstd decode")).len() as u64
+            });
+            group.register_with_input("openzl", &openzl_frame, |frame| {
+                let decoded = black_box(openzl_decompress(frame));
+                (decoded.len() * std::mem::size_of::<u32>()) as u64
             });
             group.run();
         }
