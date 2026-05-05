@@ -25,9 +25,9 @@ Important current consensus:
 Suggested next-session order:
 
 1. Re-read this plan and the implementation approval checklist.
-2. Continue Phase 3 hardening: more corrupt/map validation tests, property tests, and binary golden fixtures.
-3. Add Phase 4 `binggan` benchmarks and zstd-on-raw comparisons.
-4. Benchmark the v1 parser before adding repeated-offset emission or non-zstd side-stream codecs.
+2. Phase 3 hardening landed: map-validation negative tests (`tests/map_validation.rs`), property tests for arbitrary/structured inputs (`tests/properties.rs`), and binary golden fixtures for the three plan-spec semantic vectors plus the empty frame (`tests/golden.rs`).
+3. Phase 4 `binggan` benchmarks landed (`benches/compression.rs`) with zstd-on-raw comparisons across six synthetic datasets. Initial 256 KiB results on the dev machine: OFZL is competitive on highly compressible data (e.g. `synthetic_traces` 18.3x vs zstd 16.8x at faster encode), but slower at decode and well behind on `random` encode. See the bench output for the full picture.
+4. Benchmark-driven next steps for the v1 parser: investigate the OFZL decode gap (FieldLZ token loop is the main suspect), then evaluate repeated-offset emission and non-zstd side-stream codecs.
 
 ## Draft open-question recommendations
 
@@ -884,7 +884,7 @@ Approved checklist:
 - [x] FSE/Huffman/bitpack side-stream codecs are deferred beyond v1; zstd side streams are sufficient initially.
 - [x] Reference side-stream routing is tracked but implemented incrementally through the transform interface.
 - [x] Byte-transposed literals remain deferred to the reference literal route milestone.
-- [ ] Full binary golden fixtures still need to be generated and checked in during hardening.
+- [x] Full binary golden fixtures for the three plan-spec semantic vectors plus the empty frame are checked in (`tests/golden.rs`); all four use direct stored streams so they are zstd-version-independent. A zstd-encoded fixture has not yet been added; when one is, document the exact `zstd` crate version it was generated against.
 
 ## Next step
 

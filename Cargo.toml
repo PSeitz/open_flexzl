@@ -8,3 +8,11 @@ description = "Rust-native fixed-width numeric compression inspired by OpenZL, i
 [dependencies]
 thiserror = "2"
 zstd = { version = "0.13", features = ["experimental"] }
+
+[dev-dependencies]
+proptest = "1"
+binggan = "0.16"
+
+[[bench]]
+name = "compression"
+harness = false
