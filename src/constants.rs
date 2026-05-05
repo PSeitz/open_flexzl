@@ -4,6 +4,7 @@ pub(crate) const KIND_U32_FIELD_LZ: u8 = 1;
 
 pub(crate) const OPENZL_TYPE_NUMERIC: u8 = 4;
 
+pub(crate) const STANDARD_TRANSFORM_ID_DELTA_INT: u64 = 1;
 pub(crate) const STANDARD_TRANSFORM_ID_ZSTD: u64 = 22;
 pub(crate) const STANDARD_TRANSFORM_ID_FIELD_LZ: u64 = 24;
 

@@ -29,7 +29,8 @@ Suggested next-session order:
 3. Phase 4 `binggan` benchmarks landed (`benches/compression.rs`) with three comparison columns: OFZL, `zstd_on_raw` (raw `u32` LE bytes through zstd at level 6), and `openzl` (via the `rust-openzl 0.1` crate, which calls into the upstream OpenZL C library). Datasets: six synthetic + six curated real-world from `num_flex/test_data` (loaded via `tests/common/datasets.rs`; resolution: `OFZL_TEST_DATA_DIR` env var → `$CARGO_MANIFEST_DIR/../num_flex/test_data`; missing files are skipped). The same loader powers `tests/real_world.rs`, which round-trips every available dataset including the multi-chunk `ten_value_cycle` (~16.5 MiB → 2 chunks).
 4. **OpenZL ratio gap is dominated by missing transforms, not the parser.** Initial dev-machine results: OpenZL gets 2185× on `monotonic` (delta transform → constant), OFZL gets 1.62× (same as raw zstd). OpenZL gets 2.28× on `all_unique` vs OFZL 1.41×. OpenZL gets 251× on `ten_value_cycle` vs OFZL 120×. On encode speed, OFZL is *often faster* than OpenZL — e.g. 6.6 vs 1.7 GB/s on `single_symbol_floods`, 1.27 vs 0.79 GB/s on `ten_value_cycle`, 643 vs 96 MB/s on `all_unique`. OFZL beats zstd on ratio for two datasets (`ten_value_cycle` 120× vs 106×, `synthetic_traces` 18.4× vs 16.8×); on the rest it's tied or slightly worse than zstd-on-raw.
 5. Stage-2 cleanup landed: hash-table insertion is now sparse (start+1, periodic mid-points, end-1) instead of every position, mirroring OpenZL's fast parser. Net effect on the listed datasets: +52% encode on `repeated_blocks` (6.9 → 10.5 GB/s), +26% on `low_cardinality`, +16% on `single_symbol_floods`, with a ~1% ratio cost on `ten_value_cycle` (135597 → 137027 bytes) where some phase-shift matches go unfound.
-6. Repeated-offset emission was prototyped (rep[0]-take-immediately) and reverted: the trade was poor (5–32% encode regression for 1–15% ratio wins on a few datasets) given the dominant gap is missing transforms. Next priorities for closing the OpenZL ratio gap: (a) delta transform for monotonic-like data (huge win), (b) byte-transposed literals + per-lane entropy coding (helps wide_tail / all_unique), (c) FSE/Huffman side-stream codecs (broad ratio improvement).
+6. Repeated-offset emission was prototyped (rep[0]-take-immediately) and reverted: the trade was poor (5–32% encode regression for 1–15% ratio wins on a few datasets) given the dominant gap is missing transforms.
+7. Stage 3 landed: the OpenZL `delta_int` transform (Standard Transform ID `1`, `value -> first_value + cumulative deltas`) sits *after* FieldLZ in the decode chain — FieldLZ regenerates a delta stream and `delta_int` undoes the delta with a prefix-sum. Encoder tries both the raw path and the delta path and keeps the smaller frame. Decoder validation now accepts the final chunk stream produced either by FieldLZ directly (raw path) or by a `delta_int` whose input is the FieldLZ output (delta path); either way exactly one FieldLZ transform per chunk. Realized impact on the bench: `monotonic` 161549 → **66 bytes** (1.62× → 3970×, *beats* OpenZL's 120 bytes); `all_unique` 961823 → 727951 (1.41× → 1.87×, OpenZL still ahead at 2.28×); other datasets pick the raw path so size is unchanged. Encode cost: ~2× on most data and up to 4× on tiny chunks where fixed overhead dominates; decode cost is unchanged on raw-path frames and slightly higher on delta-path frames due to the prefix-sum pass. Future work: a cheap "skip delta if obviously not worth it" heuristic to recover encode speed on data where delta never wins. Subsequent stages remain (b) byte-transposed literals + per-lane entropy and (c) FSE/Huffman side streams.
 
 ## Draft open-question recommendations
 
@@ -315,6 +316,7 @@ OPENZL_TYPE_SERIAL:            1
 OPENZL_TYPE_STRUCT:            2
 OPENZL_TYPE_NUMERIC:           4
 OPENZL_TYPE_STRING:            8
+STANDARD_TRANSFORM_ID_DELTA_INT: 1
 STANDARD_TRANSFORM_ID_ZSTD:    22
 STANDARD_TRANSFORM_ID_FIELD_LZ: 24
 FIELD_LZ_INPUT_COUNT:          5
@@ -462,6 +464,19 @@ Zstd rules:
 - Encoder uses compression level `6` for the public `compress_u32()` default unless a future options API overrides it.
 - Empty uncompressed streams are encoded as valid zstd frames for empty input; an empty stored payload is invalid for the zstd transform.
 - Store-on-expansion remains a deliberate initial non-goal unless this plan is revised; OpenZL-style small-stream store routing is separate and should be supported by feeding a raw stored stream directly into the consuming transform.
+
+#### Delta transform, ID 1
+
+```text
+input_count:        exactly 1
+output_count:       exactly 1
+private_header:     empty
+input stream:       u32 elements (delta sequence, wrapping subtract of previous)
+output stream:      u32 elements (running prefix sum, wrapping)
+```
+
+Sits after FieldLZ in the decode chain when the delta path is chosen. Encoder
+picks per chunk by trying both paths and keeping the smaller record.
 
 #### FieldLZ transform, ID 24
 

@@ -5,6 +5,7 @@
 //! FieldLZ transform.
 
 mod constants;
+mod delta;
 mod error;
 mod field_lz;
 mod frame;
