@@ -1,14 +1,14 @@
-//! Loader for the `num_flex/test_data` representative `.uncomp` files.
+//! Loader for the checked-in `test_data` representative `.uncomp` files.
 //!
 //! Each `.uncomp` file is a UTF-8 text stream with one decimal `u32` per line.
-//! The six datasets below come from `num_flex`'s `representative_sets.json` and
-//! span a useful range of distribution shapes (single-symbol floods, small
-//! cycles, hot-head dictionaries, wide tails, all-unique).
+//! The datasets below span a useful range of distribution shapes
+//! (single-symbol floods, small cycles, hot-head dictionaries, wide tails,
+//! all-unique, and mostly-unique clustered streams).
 //!
 //! Resolution order for the data directory:
 //!
 //! 1. `OFZL_TEST_DATA_DIR` environment variable, if set.
-//! 2. `$CARGO_MANIFEST_DIR/../num_flex/test_data`.
+//! 2. `$CARGO_MANIFEST_DIR/test_data`.
 //!
 //! Missing files are skipped with a warning so the suite still passes on
 //! machines that don't have the dataset checked out.
@@ -23,25 +23,23 @@ pub struct RealWorldDataset {
     pub values: Vec<u32>,
 }
 
-/// `(label, file)` for the curated representative set, in the same order as
-/// `num_flex/test_data/representative_sets.json`.
+/// `(label, file)` for the curated representative set.
 pub const REPRESENTATIVE_SET: &[(&str, &str)] = &[
-    ("single_symbol_floods", "TemplateId(40).col1.uncomp"),
-    ("ten_value_cycle", "TemplateId(42).col0.uncomp"),
-    ("hot_head_dictionary", "TemplateId(61).col2.uncomp"),
-    ("bursty_mid_dictionary", "TemplateId(43).col3.uncomp"),
-    ("wide_tail", "TemplateId(17).col1.uncomp"),
-    ("all_unique", "TemplateId(13).col0.uncomp"),
+    ("single_symbol_floods", "single_symbol_floods.uncomp"), // TemplateId(40).col1.uncomp
+    ("ten_value_cycle", "ten_value_cycle.uncomp"), // TemplateId(42).col0.uncomp
+    ("hot_head_dictionary", "hot_head_dictionary.uncomp"), // TemplateId(61).col2.uncomp
+    ("bursty_mid_dictionary", "bursty_mid_dictionary.uncomp"), // TemplateId(43).col3.uncomp
+    ("wide_tail", "wide_tail.uncomp"), // TemplateId(17).col1.uncomp
+    ("all_unique", "all_unique.uncomp"), // TemplateId(13).col0.uncomp
+    ("clustered_wide_tail", "clustered_wide_tail.uncomp"), // TemplateId(15).col0.uncomp
+    ("mostly_unique_wide_tail", "mostly_unique_wide_tail.uncomp"), // TemplateId(39).col6.uncomp
 ];
 
 pub fn data_dir() -> PathBuf {
     if let Ok(env) = std::env::var("OFZL_TEST_DATA_DIR") {
         return PathBuf::from(env);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|parent| parent.join("num_flex/test_data"))
-        .unwrap_or_else(|| PathBuf::from("../num_flex/test_data"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
 }
 
 pub fn load_representative_set() -> Vec<RealWorldDataset> {

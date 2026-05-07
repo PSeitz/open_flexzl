@@ -36,7 +36,8 @@ struct Prepared {
 }
 
 fn main() {
-    let mut datasets = build_synthetic_datasets();
+    let mut datasets = Vec::new();
+    //let mut datasets = build_synthetic_datasets();
     for ds in real_world::load_representative_set() {
         datasets.push((ds.label, ds.values));
     }

@@ -1,4 +1,4 @@
-//! Round-trip tests on the curated num_flex test datasets.
+//! Round-trip tests on the checked-in curated test datasets.
 //!
 //! These tests are silently skipped when the data directory is unavailable so
 //! the suite still passes on machines without the dataset checked out (see
