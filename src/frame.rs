@@ -7,7 +7,6 @@
 //! decoder validates the generic graph structure so more OpenZL-style routes
 //! can be added later.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::constants::*;
@@ -107,44 +106,34 @@ fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Res
     }
 
     // Candidate 1: FieldLZ parses the original values and its output is the
-    // final chunk stream.
-    let raw_candidate =
-        serialize_chunk_encoding_candidate(chunk, ChunkEncodingCandidate::RawFieldLz)?;
+    // final chunk stream. We always need this as the fallback encoding.
+    let raw_candidate = serialize_chunk_encoding_candidate(chunk.len(), chunk, false)?;
 
-    // Candidate 2: FieldLZ parses deltas, then a delta_int transform
-    // reconstructs the original values. Building this candidate costs another
-    // full FieldLZ parse, so skip it when the raw candidate is already near an
-    // extreme: either dense matches (< 1% of source bytes) or nearly raw size
-    // (> 99%). In both cases delta has little room to improve the frame.
-    let raw_byte_len = chunk.len() * U32_WIDTH;
-    let best_chunk_bytes = if raw_candidate.len() > raw_byte_len / 100
-        && raw_candidate.len() < raw_byte_len - raw_byte_len / 100
-    {
-        let delta_candidate =
-            serialize_chunk_encoding_candidate(chunk, ChunkEncodingCandidate::DeltaFieldLz)?;
-        if delta_candidate.len() < raw_candidate.len() {
-            delta_candidate
-        } else {
-            raw_candidate
-        }
-    } else {
-        raw_candidate
+    // Encoder strategies decide whether another complete chunk encoding is
+    // worth building before paying for another FieldLZ parse plus side-stream
+    // zstd encodes.
+    let baseline = RawFieldLzBaseline {
+        encoded_len: raw_candidate.len(),
+        source_byte_len: chunk.len() * U32_WIDTH,
     };
+    let analysis = ChunkValueAnalysis::scan_u32(chunk);
+    let best_chunk_bytes = choose_smallest_chunk_encoding(
+        chunk,
+        raw_candidate,
+        &analysis,
+        &baseline,
+        &[&DELTA_INT_FIELD_LZ_STRATEGY],
+    )?;
     out.extend_from_slice(&best_chunk_bytes);
     Ok(())
 }
 
 fn serialize_chunk_encoding_candidate(
-    chunk: &[u32],
-    candidate: ChunkEncodingCandidate,
+    chunk_num_elements: usize,
+    field_lz_input_values: &[u32],
+    append_delta_transform: bool,
 ) -> Result<Vec<u8>, Error> {
-    let (field_lz_input_values, append_delta_transform): (Cow<'_, [u32]>, bool) = match candidate {
-        ChunkEncodingCandidate::RawFieldLz => (Cow::Borrowed(chunk), false),
-        ChunkEncodingCandidate::DeltaFieldLz => (Cow::Owned(delta::encode_u32_deltas(chunk)), true),
-    };
-
-    let chunk_num_elements = chunk.len();
-    let streams = field_lz::encode_u32_to_side_streams(&field_lz_input_values)?;
+    let streams = field_lz::encode_u32_to_side_streams(field_lz_input_values)?;
     let plan =
         plan_field_lz_side_stream_graph(&streams, chunk_num_elements, append_delta_transform)?;
 
@@ -565,12 +554,133 @@ fn plan_field_lz_side_stream_graph(
     })
 }
 
-// One concrete encoding option for a chunk. The chooser serializes candidates
-// and keeps the smallest byte representation.
-#[derive(Clone, Copy)]
-enum ChunkEncodingCandidate {
-    RawFieldLz,
-    DeltaFieldLz,
+static DELTA_INT_FIELD_LZ_STRATEGY: DeltaIntFieldLzStrategy = DeltaIntFieldLzStrategy;
+
+fn choose_smallest_chunk_encoding(
+    chunk: &[u32],
+    mut best_encoding: Vec<u8>,
+    analysis: &ChunkValueAnalysis,
+    baseline: &RawFieldLzBaseline,
+    strategies: &[&dyn ChunkEncodingStrategy],
+) -> Result<Vec<u8>, Error> {
+    for strategy in strategies {
+        if strategy.should_build(analysis, baseline) {
+            let candidate = strategy.encode_chunk(chunk)?;
+            if candidate.len() < best_encoding.len() {
+                best_encoding = candidate;
+            }
+        }
+    }
+    Ok(best_encoding)
+}
+
+trait ChunkEncodingStrategy {
+    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool;
+    fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error>;
+}
+
+struct RawFieldLzBaseline {
+    encoded_len: usize,
+    source_byte_len: usize,
+}
+
+struct DeltaIntFieldLzStrategy;
+
+impl ChunkEncodingStrategy for DeltaIntFieldLzStrategy {
+    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool {
+        if analysis.element_count < 2 {
+            return false;
+        }
+
+        // If raw FieldLZ is already below 1% of the source bytes, delta can only
+        // save a tiny absolute amount and usually adds graph overhead.
+        if baseline.encoded_len <= baseline.source_byte_len / 100 {
+            return false;
+        }
+
+        // Long runs of identical values are already exactly what the raw FieldLZ
+        // path handles well; delta mostly turns them into zero runs with extra
+        // graph overhead.
+        if analysis.equal_value_pairs * 4 >= analysis.element_count {
+            return false;
+        }
+
+        // Constant or mostly-constant strides are the strongest signal for
+        // delta_int.
+        if analysis.equal_delta_pairs * 2 >= analysis.element_count {
+            return true;
+        }
+
+        // Otherwise, try delta only when it creates substantially more
+        // 16-bit-ish values than the raw stream. Those high bytes become cheap
+        // literals for zstd and are where delta helped the real mostly/all-
+        // unique datasets.
+        let min_compact_gain = (analysis.element_count / 4).max(1);
+        analysis.compact_delta_16 * 2 >= analysis.element_count
+            && analysis.compact_delta_16 >= analysis.compact_value_16 + min_compact_gain
+    }
+
+    fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error> {
+        let deltas = delta::encode_u32_deltas(chunk);
+        serialize_chunk_encoding_candidate(chunk.len(), &deltas, true)
+    }
+}
+
+/// Cheap one-pass statistics used by encoder strategies to avoid building
+/// expensive candidates that are unlikely to win.
+#[derive(Default)]
+struct ChunkValueAnalysis {
+    /// Number of `u32` values in the source chunk.
+    element_count: usize,
+    /// Adjacent pairs where `value[i] == value[i - 1]`; strong signal that raw
+    /// FieldLZ already handles the chunk well.
+    equal_value_pairs: usize,
+    /// Adjacent pairs where the wrapping delta is unchanged; strong signal for
+    /// the `delta_int -> FieldLZ` strategy.
+    equal_delta_pairs: usize,
+    /// Source values whose high two bytes are either `00 00` or `ff ff`.
+    compact_value_16: usize,
+    /// Wrapping deltas whose high two bytes are either `00 00` or `ff ff`.
+    compact_delta_16: usize,
+}
+
+impl ChunkValueAnalysis {
+    fn scan_u32(chunk: &[u32]) -> Self {
+        let mut analysis = Self {
+            element_count: chunk.len(),
+            ..Self::default()
+        };
+        let mut previous_value = 0u32;
+        let mut previous_delta = None;
+
+        for (index, &value) in chunk.iter().enumerate() {
+            if compressible_high_16_bits(value) {
+                analysis.compact_value_16 += 1;
+            }
+            if index != 0 && value == previous_value {
+                analysis.equal_value_pairs += 1;
+            }
+
+            let delta = value.wrapping_sub(previous_value);
+            if compressible_high_16_bits(delta) {
+                analysis.compact_delta_16 += 1;
+            }
+            if previous_delta == Some(delta) {
+                analysis.equal_delta_pairs += 1;
+            }
+
+            previous_value = value;
+            previous_delta = Some(delta);
+        }
+
+        analysis
+    }
+}
+
+fn compressible_high_16_bits(value: u32) -> bool {
+    // Values whose high two bytes are all 0x00 or all 0xff have highly
+    // compressible high bytes in the little-endian literal stream.
+    value <= 0x0000_ffff || value >= 0xffff_0000
 }
 
 struct ChunkGraphPlan {
