@@ -1,3 +1,10 @@
+//! Magicless zstd transform wrapper.
+//!
+//! OFZL transform records already identify zstd payloads, so we store zstd
+//! frames without the normal magic bytes. The frame content size is mandatory;
+//! the decoder reads it before allocating and verifies decompression produces
+//! exactly that many bytes.
+
 use std::io::Write;
 use std::mem::MaybeUninit;
 

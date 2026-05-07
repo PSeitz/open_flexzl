@@ -26,12 +26,12 @@ pub struct RealWorldDataset {
 /// `(label, file)` for the curated representative set.
 pub const REPRESENTATIVE_SET: &[(&str, &str)] = &[
     ("single_symbol_floods", "single_symbol_floods.uncomp"), // TemplateId(40).col1.uncomp
-    ("ten_value_cycle", "ten_value_cycle.uncomp"), // TemplateId(42).col0.uncomp
-    ("hot_head_dictionary", "hot_head_dictionary.uncomp"), // TemplateId(61).col2.uncomp
+    ("ten_value_cycle", "ten_value_cycle.uncomp"),           // TemplateId(42).col0.uncomp
+    ("hot_head_dictionary", "hot_head_dictionary.uncomp"),   // TemplateId(61).col2.uncomp
     ("bursty_mid_dictionary", "bursty_mid_dictionary.uncomp"), // TemplateId(43).col3.uncomp
-    ("wide_tail", "wide_tail.uncomp"), // TemplateId(17).col1.uncomp
-    ("all_unique", "all_unique.uncomp"), // TemplateId(13).col0.uncomp
-    ("clustered_wide_tail", "clustered_wide_tail.uncomp"), // TemplateId(15).col0.uncomp
+    ("wide_tail", "wide_tail.uncomp"),                       // TemplateId(17).col1.uncomp
+    ("all_unique", "all_unique.uncomp"),                     // TemplateId(13).col0.uncomp
+    ("clustered_wide_tail", "clustered_wide_tail.uncomp"),   // TemplateId(15).col0.uncomp
     ("mostly_unique_wide_tail", "mostly_unique_wide_tail.uncomp"), // TemplateId(39).col6.uncomp
 ];
 

@@ -1,7 +1,11 @@
 pub(crate) const MAGIC: &[u8; 4] = b"OFZL";
 pub(crate) const VERSION_V1: u8 = 1;
+
+// Native profile ID: a u32 stream encoded as chunk-local FieldLZ graphs.
 pub(crate) const KIND_U32_FIELD_LZ: u8 = 1;
 
+// These type/transform IDs intentionally line up with OpenZL where possible,
+// even though the outer frame format is native to this crate.
 pub(crate) const OPENZL_TYPE_NUMERIC: u8 = 4;
 
 pub(crate) const STANDARD_TRANSFORM_ID_DELTA_INT: u64 = 1;

@@ -1,3 +1,8 @@
+//! Canonical unsigned LEB128/LEBU64 helpers used by the native frame format.
+//!
+//! Decoding rejects overlong/non-canonical encodings so every integer has a
+//! single wire representation.
+
 use crate::Error;
 
 pub(crate) fn write_u64(mut value: u64, out: &mut Vec<u8>) {

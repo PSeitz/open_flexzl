@@ -1,10 +1,27 @@
+//! Native OFZL frame encoder/decoder.
+//!
+//! A frame is split into independent chunks. Each chunk contains a tiny
+//! decode graph: stored byte streams plus transform records in execution
+//! order. The current encoder emits a deliberately small graph
+//! (`store-or-zstd side streams -> FieldLZ -> optional delta_int`), while the
+//! decoder validates the generic graph structure so more OpenZL-style routes
+//! can be added later.
+
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::constants::*;
 use crate::delta;
-use crate::field_lz::{self, le_bytes_to_u32s, FieldLzStreams};
+use crate::field_lz::{self, le_bytes_to_u32s, FieldLzSideStreams};
 use crate::varint::{self, Reader};
 use crate::{zstd_codec, Error};
+
+// FieldLZ consumes five side streams in this exact order:
+// literals, tokens, explicit offsets, extra literal lengths, extra match
+// lengths. The element width is carried through zstd headers and checked before
+// the FieldLZ transform runs.
+const FIELD_LZ_INPUT_WIDTHS: [usize; FIELD_LZ_INPUT_COUNT] =
+    [U32_WIDTH, U16_WIDTH, U32_WIDTH, U32_WIDTH, U32_WIDTH];
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     let chunk_count = if input.is_empty() {
@@ -23,7 +40,7 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     varint::write_usize(chunk_count, &mut out);
 
     for chunk in input.chunks(MAX_CHUNK_ELEMENTS_U32) {
-        write_chunk(chunk, &mut out)?;
+        choose_and_write_best_chunk_encoding(chunk, &mut out)?;
     }
 
     Ok(out)
@@ -60,7 +77,7 @@ pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
     let mut output = Vec::new();
     let mut total = 0usize;
     for _ in 0..chunk_count {
-        let chunk = read_chunk(&mut reader)?;
+        let chunk = decode_chunk_encoding(&mut reader)?;
         total = total
             .checked_add(chunk.len())
             .ok_or(Error::InvalidFrame("chunk element total overflow"))?;
@@ -84,49 +101,66 @@ pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
     Ok(output)
 }
 
-fn write_chunk(chunk: &[u32], out: &mut Vec<u8>) -> Result<(), Error> {
+fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Result<(), Error> {
     if chunk.is_empty() || chunk.len() > MAX_CHUNK_ELEMENTS_U32 {
         return Err(Error::InvalidFrame("invalid chunk element count"));
     }
 
-    let raw = build_chunk_record(chunk, chunk, false)?;
-    // Skip the delta probe when raw is already in either extreme — dense
-    // matches (< 1% of source) or essentially incompressible (> 99%) — since
-    // delta has no headroom to win in either case.
-    let raw_bytes = chunk.len() * U32_WIDTH;
-    let chosen = if raw.len() > raw_bytes / 100 && raw.len() < raw_bytes - raw_bytes / 100 {
-        let deltas = delta::apply_u32(chunk);
-        let dr = build_chunk_record(chunk, &deltas, true)?;
-        if dr.len() < raw.len() { dr } else { raw }
+    // Candidate 1: FieldLZ parses the original values and its output is the
+    // final chunk stream.
+    let raw_candidate =
+        serialize_chunk_encoding_candidate(chunk, ChunkEncodingCandidate::RawFieldLz)?;
+
+    // Candidate 2: FieldLZ parses deltas, then a delta_int transform
+    // reconstructs the original values. Building this candidate costs another
+    // full FieldLZ parse, so skip it when the raw candidate is already near an
+    // extreme: either dense matches (< 1% of source bytes) or nearly raw size
+    // (> 99%). In both cases delta has little room to improve the frame.
+    let raw_byte_len = chunk.len() * U32_WIDTH;
+    let best_chunk_bytes = if raw_candidate.len() > raw_byte_len / 100
+        && raw_candidate.len() < raw_byte_len - raw_byte_len / 100
+    {
+        let delta_candidate =
+            serialize_chunk_encoding_candidate(chunk, ChunkEncodingCandidate::DeltaFieldLz)?;
+        if delta_candidate.len() < raw_candidate.len() {
+            delta_candidate
+        } else {
+            raw_candidate
+        }
     } else {
-        raw
+        raw_candidate
     };
-    out.extend_from_slice(&chosen);
+    out.extend_from_slice(&best_chunk_bytes);
     Ok(())
 }
 
-fn build_chunk_record(
+fn serialize_chunk_encoding_candidate(
     chunk: &[u32],
-    parser_input: &[u32],
-    use_delta: bool,
+    candidate: ChunkEncodingCandidate,
 ) -> Result<Vec<u8>, Error> {
-    let streams = field_lz::parse_u32(parser_input)?;
-    let (stored_streams, transforms, final_stream_id, stream_slot_count) =
-        plan_chunk_streams(&streams, chunk.len(), use_delta)?;
+    let (field_lz_input_values, append_delta_transform): (Cow<'_, [u32]>, bool) = match candidate {
+        ChunkEncodingCandidate::RawFieldLz => (Cow::Borrowed(chunk), false),
+        ChunkEncodingCandidate::DeltaFieldLz => (Cow::Owned(delta::encode_u32_deltas(chunk)), true),
+    };
+
+    let chunk_num_elements = chunk.len();
+    let streams = field_lz::encode_u32_to_side_streams(&field_lz_input_values)?;
+    let plan =
+        plan_field_lz_side_stream_graph(&streams, chunk_num_elements, append_delta_transform)?;
 
     let mut r = Vec::new();
-    varint::write_usize(chunk.len(), &mut r);
-    varint::write_usize(stream_slot_count, &mut r);
-    varint::write_usize(stored_streams.len(), &mut r);
-    varint::write_usize(transforms.len(), &mut r);
-    varint::write_usize(final_stream_id, &mut r);
+    varint::write_usize(chunk_num_elements, &mut r);
+    varint::write_usize(plan.stream_slot_count, &mut r);
+    varint::write_usize(plan.stored_streams.len(), &mut r);
+    varint::write_usize(plan.transforms.len(), &mut r);
+    varint::write_usize(plan.final_stream_id, &mut r);
 
-    for s in stored_streams {
+    for s in plan.stored_streams {
         varint::write_usize(s.stream_id, &mut r);
         varint::write_usize(s.payload.len(), &mut r);
         r.extend_from_slice(&s.payload);
     }
-    for t in transforms {
+    for t in plan.transforms {
         varint::write_u64(t.transform_id, &mut r);
         varint::write_usize(t.inputs.len(), &mut r);
         for i in t.inputs {
@@ -142,7 +176,11 @@ fn build_chunk_record(
     Ok(r)
 }
 
-fn read_chunk(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
+fn decode_chunk_encoding(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
+    // The map is encoded in dependency order: stored streams are available
+    // first, then every transform may only reference streams that have already
+    // been defined. This lets us execute while reading and still validate that
+    // every declared stream slot is defined exactly once.
     let chunk_num_elements = reader.read_usize("chunk_num_elements")?;
     if chunk_num_elements == 0 || chunk_num_elements > MAX_CHUNK_ELEMENTS_U32 {
         return Err(Error::InvalidFrame("chunk element count out of range"));
@@ -168,7 +206,7 @@ fn read_chunk(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
         return Err(Error::InvalidMap("final stream id is out of range"));
     }
 
-    let mut slots = vec![Slot::default(); stream_slot_count];
+    let mut slots = vec![StreamSlot::default(); stream_slot_count];
 
     for _ in 0..stored_stream_count {
         let stream_id = reader.read_usize("stored stream id")?;
@@ -183,15 +221,25 @@ fn read_chunk(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
         slots[stream_id].bytes = Some(payload);
     }
 
-    let mut log: Vec<ExecutedTransform> = Vec::with_capacity(transform_count);
+    let mut transform_log: Vec<TransformLogEntry> = Vec::with_capacity(transform_count);
     for _ in 0..transform_count {
-        read_transform(reader, chunk_num_elements, &mut slots, &mut log)?;
+        read_and_execute_transform_record(
+            reader,
+            chunk_num_elements,
+            &mut slots,
+            &mut transform_log,
+        )?;
     }
 
     if slots[final_stream_id].bytes.is_none() {
         return Err(Error::InvalidMap("final stream is undefined"));
     }
-    let mut field_lz_outputs = log
+    // For a `compress_u32()` frame, the only legal final producers are:
+    //   FieldLZ                         (raw path)
+    //   FieldLZ -> delta_int            (delta path)
+    // Side-stream zstd transforms are internal inputs to FieldLZ and must not
+    // become the final chunk stream.
+    let mut field_lz_outputs = transform_log
         .iter()
         .filter(|t| t.id == STANDARD_TRANSFORM_ID_FIELD_LZ);
     let field_lz_output = field_lz_outputs
@@ -203,7 +251,7 @@ fn read_chunk(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
     if field_lz_outputs.next().is_some() {
         return Err(Error::InvalidMap("more than one FieldLZ transform"));
     }
-    let final_producer = log.iter().find(|t| t.output == final_stream_id);
+    let final_producer = transform_log.iter().find(|t| t.output == final_stream_id);
     let valid_final = match final_producer {
         Some(t) if t.id == STANDARD_TRANSFORM_ID_FIELD_LZ => t.output == field_lz_output,
         Some(t) if t.id == STANDARD_TRANSFORM_ID_DELTA_INT => t.input == Some(field_lz_output),
@@ -241,11 +289,11 @@ fn read_chunk(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
     le_bytes_to_u32s(&final_bytes)
 }
 
-fn read_transform(
+fn read_and_execute_transform_record(
     reader: &mut Reader<'_>,
     chunk_num_elements: usize,
-    slots: &mut [Slot],
-    log: &mut Vec<ExecutedTransform>,
+    slots: &mut [StreamSlot],
+    transform_log: &mut Vec<TransformLogEntry>,
 ) -> Result<(), Error> {
     let transform_id = reader.read_u64("transform_id")?;
     let input_count = reader.read_usize("input_count")?;
@@ -255,7 +303,7 @@ fn read_transform(
     let mut inputs = Vec::with_capacity(input_count);
     for _ in 0..input_count {
         let stream_id = reader.read_usize("input stream id")?;
-        validate_input_stream_id(stream_id, slots)?;
+        validate_transform_input_stream_id(stream_id, slots)?;
         inputs.push(stream_id);
     }
 
@@ -285,7 +333,10 @@ fn read_transform(
         slots[input].used = true;
     }
 
-    let (output_id, output_bytes, element_width) = match transform_id {
+    // The wire format allows multi-output transforms because OpenZL uses them
+    // for routes such as transpose-split and quantize. The transforms supported
+    // today each produce exactly one output, represented by `TransformOutput`.
+    let output = match transform_id {
         STANDARD_TRANSFORM_ID_ZSTD => {
             execute_zstd_transform(&inputs, &outputs, &private_header, slots)?
         }
@@ -302,13 +353,13 @@ fn read_transform(
         other => return Err(Error::UnsupportedTransform(other)),
     };
 
-    log.push(ExecutedTransform {
+    transform_log.push(TransformLogEntry {
         id: transform_id,
         input: inputs.first().copied(),
-        output: output_id,
+        output: output.stream_id,
     });
-    slots[output_id].bytes = Some(output_bytes);
-    slots[output_id].element_width = element_width;
+    slots[output.stream_id].element_width = output.element_width;
+    slots[output.stream_id].bytes = Some(output.bytes);
     Ok(())
 }
 
@@ -316,8 +367,8 @@ fn execute_zstd_transform(
     inputs: &[usize],
     outputs: &[usize],
     private_header: &[u8],
-    slots: &[Slot],
-) -> Result<(usize, Vec<u8>, Option<usize>), Error> {
+    slots: &[StreamSlot],
+) -> Result<TransformOutput, Error> {
     if inputs.len() != 1 || outputs.len() != 1 {
         return Err(Error::InvalidTransform(
             "zstd transform must have exactly one input and one output",
@@ -328,22 +379,29 @@ fn execute_zstd_transform(
         .bytes
         .as_deref()
         .ok_or(Error::InvalidMap("zstd input stream is undefined"))?;
-    let output = zstd_codec::decode_magicless(input, output_elt_width)?;
-    Ok((outputs[0], output, Some(output_elt_width)))
+    let bytes = zstd_codec::decode_magicless(input, output_elt_width)?;
+    Ok(TransformOutput {
+        stream_id: outputs[0],
+        bytes,
+        element_width: Some(output_elt_width),
+    })
 }
 
 fn execute_delta_int_transform(
     inputs: &[usize],
     outputs: &[usize],
     private_header: &[u8],
-    slots: &[Slot],
-) -> Result<(usize, Vec<u8>, Option<usize>), Error> {
+    slots: &[StreamSlot],
+) -> Result<TransformOutput, Error> {
     if inputs.len() != 1 || outputs.len() != 1 || !private_header.is_empty() {
         return Err(Error::InvalidTransform(
             "delta_int transform must have one input, one output, and an empty private header",
         ));
     }
-    if slots[inputs[0]].element_width.is_some_and(|w| w != U32_WIDTH) {
+    if slots[inputs[0]]
+        .element_width
+        .is_some_and(|w| w != U32_WIDTH)
+    {
         return Err(Error::InvalidTransform(
             "delta_int input element width must be 4 for u32",
         ));
@@ -352,7 +410,11 @@ fn execute_delta_int_transform(
         .bytes
         .as_deref()
         .ok_or(Error::InvalidMap("delta_int input stream is undefined"))?;
-    Ok((outputs[0], delta::undo_bytes(input)?, Some(U32_WIDTH)))
+    Ok(TransformOutput {
+        stream_id: outputs[0],
+        bytes: delta::decode_u32_delta_bytes(input)?,
+        element_width: Some(U32_WIDTH),
+    })
 }
 
 fn execute_field_lz_transform(
@@ -360,8 +422,8 @@ fn execute_field_lz_transform(
     outputs: &[usize],
     private_header: &[u8],
     chunk_num_elements: usize,
-    slots: &[Slot],
-) -> Result<(usize, Vec<u8>, Option<usize>), Error> {
+    slots: &[StreamSlot],
+) -> Result<TransformOutput, Error> {
     if inputs.len() != FIELD_LZ_INPUT_COUNT || outputs.len() != 1 {
         return Err(Error::InvalidTransform(
             "FieldLZ transform must have five inputs and one output",
@@ -370,12 +432,11 @@ fn execute_field_lz_transform(
     let declared_elements = varint::read_single_usize(private_header, "FieldLZ chunk length")?;
     if declared_elements != chunk_num_elements {
         return Err(Error::InvalidTransform(
-            "FieldLZ private chunk length does not match chunk record",
+            "FieldLZ private chunk length does not match chunk encoding",
         ));
     }
 
-    let expected_widths = [U32_WIDTH, U16_WIDTH, U32_WIDTH, U32_WIDTH, U32_WIDTH];
-    for (&stream_id, expected_width) in inputs.iter().zip(expected_widths) {
+    for (&stream_id, expected_width) in inputs.iter().zip(FIELD_LZ_INPUT_WIDTHS) {
         if let Some(actual_width) = slots[stream_id].element_width {
             if actual_width != expected_width {
                 return Err(Error::InvalidTransform(
@@ -407,11 +468,15 @@ fn execute_field_lz_transform(
             .as_deref()
             .ok_or(Error::InvalidMap("FieldLZ input 4 is undefined"))?,
     ];
-    let output = field_lz::decode(input_refs, chunk_num_elements)?;
-    Ok((outputs[0], output, Some(U32_WIDTH)))
+    let bytes = field_lz::decode_side_streams(input_refs, chunk_num_elements)?;
+    Ok(TransformOutput {
+        stream_id: outputs[0],
+        bytes,
+        element_width: Some(U32_WIDTH),
+    })
 }
 
-fn validate_input_stream_id(stream_id: usize, slots: &[Slot]) -> Result<(), Error> {
+fn validate_transform_input_stream_id(stream_id: usize, slots: &[StreamSlot]) -> Result<(), Error> {
     if stream_id >= slots.len() {
         return Err(Error::InvalidMap("transform input id is out of range"));
     }
@@ -421,24 +486,28 @@ fn validate_input_stream_id(stream_id: usize, slots: &[Slot]) -> Result<(), Erro
     Ok(())
 }
 
-fn plan_chunk_streams(
-    streams: &FieldLzStreams,
+fn plan_field_lz_side_stream_graph(
+    streams: &FieldLzSideStreams,
     chunk_num_elements: usize,
-    use_delta: bool,
-) -> Result<(Vec<StoredStream>, Vec<TransformRecord>, usize, usize), Error> {
-    let side_streams = streams.as_array();
-    let widths = [U32_WIDTH, U16_WIDTH, U32_WIDTH, U32_WIDTH, U32_WIDTH];
+    append_delta_transform: bool,
+) -> Result<ChunkGraphPlan, Error> {
+    // Bootstrap planner: every FieldLZ side stream is either stored directly if
+    // it is tiny, or stored as a zstd payload followed by a zstd decode step.
+    // Reference OpenZL has richer routes here (literal byte lanes,
+    // quantized offsets/lengths, Huffman/FSE/bitpack). This function is the
+    // intended replacement point for those future routes.
+    let side_streams = streams.as_decode_inputs();
 
     let mut stored_streams = Vec::with_capacity(FIELD_LZ_INPUT_COUNT);
     let mut transforms = Vec::with_capacity(FIELD_LZ_INPUT_COUNT + 2);
     let mut field_lz_inputs = Vec::with_capacity(FIELD_LZ_INPUT_COUNT);
     let mut next_stream_id = 0usize;
 
-    for (bytes, width) in side_streams.into_iter().zip(widths) {
+    for (bytes, width) in side_streams.into_iter().zip(FIELD_LZ_INPUT_WIDTHS) {
         if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
             let stream_id = next_stream_id;
             next_stream_id += 1;
-            stored_streams.push(StoredStream {
+            stored_streams.push(StoredStreamRecord {
                 stream_id,
                 payload: bytes.to_vec(),
             });
@@ -448,7 +517,7 @@ fn plan_chunk_streams(
             let decoded_id = next_stream_id + 1;
             next_stream_id += 2;
             let payload = zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?;
-            stored_streams.push(StoredStream {
+            stored_streams.push(StoredStreamRecord {
                 stream_id: stored_id,
                 payload,
             });
@@ -471,7 +540,10 @@ fn plan_chunk_streams(
         private_header: varint::encode_u64(chunk_num_elements as u64),
     });
 
-    let final_stream_id = if use_delta {
+    // If the candidate was parsed from deltas, FieldLZ reconstructs the delta
+    // stream first. The final stream is produced by a following delta_int
+    // transform that converts deltas back to original values.
+    let final_stream_id = if append_delta_transform {
         let delta_output_id = next_stream_id;
         next_stream_id += 1;
         transforms.push(TransformRecord {
@@ -485,14 +557,38 @@ fn plan_chunk_streams(
         field_lz_output_id
     };
 
-    Ok((stored_streams, transforms, final_stream_id, next_stream_id))
+    Ok(ChunkGraphPlan {
+        stored_streams,
+        transforms,
+        final_stream_id,
+        stream_slot_count: next_stream_id,
+    })
 }
 
-struct StoredStream {
+// One concrete encoding option for a chunk. The chooser serializes candidates
+// and keeps the smallest byte representation.
+#[derive(Clone, Copy)]
+enum ChunkEncodingCandidate {
+    RawFieldLz,
+    DeltaFieldLz,
+}
+
+struct ChunkGraphPlan {
+    stored_streams: Vec<StoredStreamRecord>,
+    transforms: Vec<TransformRecord>,
+    final_stream_id: usize,
+    stream_slot_count: usize,
+}
+
+// A payload that appears directly in the serialized chunk encoding. If this
+// stream feeds a zstd transform, the payload is magicless zstd bytes. If it
+// feeds FieldLZ directly, the payload is already the raw side-stream bytes.
+struct StoredStreamRecord {
     stream_id: usize,
     payload: Vec<u8>,
 }
 
+// Serialized transform step. Records are written and read in decode order.
 struct TransformRecord {
     transform_id: u64,
     inputs: Vec<usize>,
@@ -501,13 +597,21 @@ struct TransformRecord {
 }
 
 #[derive(Clone, Default)]
-struct Slot {
+struct StreamSlot {
     bytes: Option<Vec<u8>>,
     used: bool,
     element_width: Option<usize>,
 }
 
-struct ExecutedTransform {
+struct TransformOutput {
+    stream_id: usize,
+    bytes: Vec<u8>,
+    element_width: Option<usize>,
+}
+
+// Minimal execution log used for final-map validation. It is intentionally not
+// a full graph IR; it only answers "who produced the final stream?".
+struct TransformLogEntry {
     id: u64,
     input: Option<usize>,
     output: usize,

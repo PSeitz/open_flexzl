@@ -1,11 +1,13 @@
-//! `delta_int` transform (OpenZL Standard Transform ID 1). Stored as the
-//! first value followed by per-element wrapping deltas; decoder undoes via
-//! prefix sum. Lossless on every `u32` input regardless of overflow.
+//! `delta_int` transform (OpenZL Standard Transform ID 1).
+//!
+//! The encoded stream stores `value[i] - value[i - 1]` with wrapping `u32`
+//! arithmetic, using zero as the value before the first element. Decoding is a
+//! wrapping prefix sum, so the transform is lossless even across overflows.
 
 use crate::constants::U32_WIDTH;
 use crate::Error;
 
-pub(crate) fn apply_u32(input: &[u32]) -> Vec<u32> {
+pub(crate) fn encode_u32_deltas(input: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(input.len());
     let mut prev = 0u32;
     for &value in input {
@@ -15,7 +17,7 @@ pub(crate) fn apply_u32(input: &[u32]) -> Vec<u32> {
     out
 }
 
-pub(crate) fn undo_bytes(deltas: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn decode_u32_delta_bytes(deltas: &[u8]) -> Result<Vec<u8>, Error> {
     if !deltas.len().is_multiple_of(U32_WIDTH) {
         return Err(Error::InvalidTransform(
             "delta_int input length is not a multiple of 4",
@@ -44,8 +46,11 @@ mod tests {
             vec![0, u32::MAX, 0, u32::MAX],
         ];
         for input in cases {
-            let bytes: Vec<u8> = apply_u32(input).iter().flat_map(|d| d.to_le_bytes()).collect();
-            let recovered: Vec<u32> = undo_bytes(&bytes)
+            let bytes: Vec<u8> = encode_u32_deltas(input)
+                .iter()
+                .flat_map(|d| d.to_le_bytes())
+                .collect();
+            let recovered: Vec<u32> = decode_u32_delta_bytes(&bytes)
                 .unwrap()
                 .chunks_exact(U32_WIDTH)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

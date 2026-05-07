@@ -1,8 +1,16 @@
+//! FieldLZ parser and decoder for `u32` chunks.
+//!
+//! FieldLZ is the LZ layer used by the frame code. Encoding does not produce a
+//! self-contained byte stream; it splits a chunk into five logical side streams
+//! (literals, tokens, offsets, extra literal lengths, extra match lengths). The
+//! frame planner then decides how each side stream is stored or transformed.
+
 use crate::constants::{MAX_OFFSET_ELEMENTS, U16_WIDTH, U32_WIDTH};
 use crate::Error;
 
+/// The five FieldLZ side streams, stored as little-endian bytes.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FieldLzStreams {
+pub(crate) struct FieldLzSideStreams {
     pub(crate) literals: Vec<u8>,
     pub(crate) tokens: Vec<u8>,
     pub(crate) offsets: Vec<u8>,
@@ -10,8 +18,9 @@ pub(crate) struct FieldLzStreams {
     pub(crate) extra_match_lengths: Vec<u8>,
 }
 
-impl FieldLzStreams {
-    pub(crate) fn as_array(&self) -> [&[u8]; 5] {
+impl FieldLzSideStreams {
+    /// Return streams in the order required by the FieldLZ transform record.
+    pub(crate) fn as_decode_inputs(&self) -> [&[u8]; 5] {
         [
             &self.literals,
             &self.tokens,
@@ -22,18 +31,27 @@ impl FieldLzStreams {
     }
 }
 
-pub(crate) fn parse_u32(input: &[u32]) -> Result<FieldLzStreams, Error> {
+/// Parse a `u32` chunk into FieldLZ side streams.
+///
+/// The parser is a fast, single-candidate hash-table parser. It currently emits
+/// only explicit-offset tokens (`offset_code = 3`), although the decoder accepts
+/// the full repeated-offset token semantics so the encoder can improve later
+/// without changing the wire format.
+pub(crate) fn encode_u32_to_side_streams(input: &[u32]) -> Result<FieldLzSideStreams, Error> {
     if input.len() > crate::constants::MAX_CHUNK_ELEMENTS_U32 {
         return Err(Error::LimitExceeded("FieldLZ chunk element count"));
     }
 
-    let mut out = FieldLzStreams::default();
-    let mut table = HashTable::new(table_size(input.len()));
+    let mut out = FieldLzSideStreams::default();
+    let mut table = MatchHashTable::new(match_table_size(input.len()));
     let mut anchor = 0usize;
     let mut i = 0usize;
 
     while i + 1 < input.len() {
-        let hash = hash_pair(input[i], input[i + 1], table.mask());
+        // Hash two adjacent values. A candidate must match at least those two
+        // values, which is why the encoder minimum match length is 2 even
+        // though the FieldLZ token format can represent length 1.
+        let hash = hash_two_values(input[i], input[i + 1], table.mask());
         let candidate_plus_one = table.get(hash);
         let candidate = candidate_plus_one.wrapping_sub(1) as usize;
         table.set(hash, (i + 1) as u32);
@@ -41,15 +59,15 @@ pub(crate) fn parse_u32(input: &[u32]) -> Result<FieldLzStreams, Error> {
         if candidate_plus_one != 0 && candidate < i {
             let offset = i - candidate;
             if offset <= MAX_OFFSET_ELEMENTS {
-                let match_len = count_match(input, candidate, i);
+                let match_len = count_match_len(input, candidate, i);
                 if match_len >= 2 {
-                    emit_literals(&input[anchor..i], &mut out.literals);
-                    emit_sequence(i - anchor, match_len, offset, &mut out)?;
+                    append_literal_values(&input[anchor..i], &mut out.literals);
+                    append_match_sequence(i - anchor, match_len, offset, &mut out)?;
 
                     let match_end = i
                         .checked_add(match_len)
                         .ok_or(Error::InvalidFieldLz("match end overflow during encoding"))?;
-                    insert_matched_range(input, i, match_end, &mut table);
+                    seed_hash_table_after_match(input, i, match_end, &mut table);
                     i = match_end;
                     anchor = i;
                     continue;
@@ -60,11 +78,18 @@ pub(crate) fn parse_u32(input: &[u32]) -> Result<FieldLzStreams, Error> {
         i += 1;
     }
 
-    emit_literals(&input[anchor..], &mut out.literals);
+    append_literal_values(&input[anchor..], &mut out.literals);
     Ok(out)
 }
 
-pub(crate) fn decode(inputs: [&[u8]; 5], chunk_num_elements: usize) -> Result<Vec<u8>, Error> {
+/// Reconstruct a chunk from the five FieldLZ side streams.
+///
+/// The returned bytes are canonical little-endian `u32` values. Frame-level code
+/// converts them back to `Vec<u32>` after validating the final byte length.
+pub(crate) fn decode_side_streams(
+    inputs: [&[u8]; 5],
+    chunk_num_elements: usize,
+) -> Result<Vec<u8>, Error> {
     let literal_bytes = inputs[0];
     let token_bytes = inputs[1];
     let offset_bytes = inputs[2];
@@ -113,11 +138,11 @@ pub(crate) fn decode(inputs: [&[u8]; 5], chunk_num_elements: usize) -> Result<Ve
         ));
     }
 
-    let literals = read_u32_stream(literal_bytes);
-    let tokens = read_u16_stream(token_bytes);
-    let offsets = read_u32_stream(offset_bytes);
-    let extra_ll = read_u32_stream(extra_ll_bytes);
-    let extra_ml = read_u32_stream(extra_ml_bytes);
+    let literals = read_le_u32_stream(literal_bytes);
+    let tokens = read_le_u16_stream(token_bytes);
+    let offsets = read_le_u32_stream(offset_bytes);
+    let extra_ll = read_le_u32_stream(extra_ll_bytes);
+    let extra_ml = read_le_u32_stream(extra_ml_bytes);
 
     let mut literal_pos = 0usize;
     let mut offset_pos = 0usize;
@@ -135,6 +160,8 @@ pub(crate) fn decode(inputs: [&[u8]; 5], chunk_num_elements: usize) -> Result<Ve
         let literal_code = ((token >> 2) & 0x000f) as usize;
         let match_code = ((token >> 6) & 0x000f) as usize;
 
+        // Offset codes 0..=2 reuse recent offsets. Code 3 consumes an explicit
+        // offset from the offset side stream and pushes it into the repeat set.
         let offset = match offset_code {
             0 => repeated_offsets[0],
             1 => {
@@ -168,6 +195,8 @@ pub(crate) fn decode(inputs: [&[u8]; 5], chunk_num_elements: usize) -> Result<Ve
             _ => unreachable!(),
         };
 
+        // Literal/match length code 15 means "read an extra u32 and add it to
+        // the base". Extra value 0 is valid and represents exactly the base.
         let literal_len = if literal_code < 15 {
             literal_code
         } else {
@@ -259,12 +288,14 @@ pub(crate) fn decode(inputs: [&[u8]; 5], chunk_num_elements: usize) -> Result<Ve
     Ok(u32s_to_le_bytes(&output))
 }
 
-fn emit_sequence(
+fn append_match_sequence(
     literal_len: usize,
     match_len: usize,
     offset: usize,
-    out: &mut FieldLzStreams,
+    out: &mut FieldLzSideStreams,
 ) -> Result<(), Error> {
+    // FieldLZ packs the common case directly into a 16-bit token. Long literal
+    // or match lengths spill the excess into their side streams.
     if offset == 0 || offset > MAX_OFFSET_ELEMENTS {
         return Err(Error::InvalidFieldLz("encoder produced invalid offset"));
     }
@@ -303,7 +334,12 @@ fn emit_sequence(
     Ok(())
 }
 
-fn insert_matched_range(input: &[u32], start: usize, end: usize, table: &mut HashTable) {
+fn seed_hash_table_after_match(
+    input: &[u32],
+    start: usize,
+    end: usize,
+    table: &mut MatchHashTable,
+) {
     // Mirror OpenZL's fast parser by inserting only a handful of hash
     // entries per match instead of every position in the range. For short
     // matches we still cover every interior position (cheap, useful);
@@ -312,7 +348,7 @@ fn insert_matched_range(input: &[u32], start: usize, end: usize, table: &mut Has
     let limit = input.len().saturating_sub(1);
     let mut put = |pos: usize| {
         if pos > start && pos < end && pos < limit {
-            let hash = hash_pair(input[pos], input[pos + 1], table.mask());
+            let hash = hash_two_values(input[pos], input[pos + 1], table.mask());
             table.set(hash, (pos + 1) as u32);
         }
     };
@@ -333,7 +369,7 @@ fn insert_matched_range(input: &[u32], start: usize, end: usize, table: &mut Has
     }
 }
 
-fn count_match(input: &[u32], candidate: usize, current: usize) -> usize {
+fn count_match_len(input: &[u32], candidate: usize, current: usize) -> usize {
     let mut len = 0usize;
     while current + len < input.len() && input[candidate + len] == input[current + len] {
         len += 1;
@@ -341,21 +377,21 @@ fn count_match(input: &[u32], candidate: usize, current: usize) -> usize {
     len
 }
 
-fn emit_literals(literals: &[u32], out: &mut Vec<u8>) {
+fn append_literal_values(literals: &[u32], out: &mut Vec<u8>) {
     out.reserve(literals.len() * U32_WIDTH);
     for &value in literals {
         push_u32(value, out);
     }
 }
 
-fn read_u16_stream(bytes: &[u8]) -> Vec<u16> {
+fn read_le_u16_stream(bytes: &[u8]) -> Vec<u16> {
     bytes
         .chunks_exact(U16_WIDTH)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect()
 }
 
-fn read_u32_stream(bytes: &[u8]) -> Vec<u32> {
+fn read_le_u32_stream(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(U32_WIDTH)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -376,7 +412,7 @@ pub(crate) fn le_bytes_to_u32s(bytes: &[u8]) -> Result<Vec<u32>, Error> {
             "u32 byte stream length is not a multiple of 4",
         ));
     }
-    Ok(read_u32_stream(bytes))
+    Ok(read_le_u32_stream(bytes))
 }
 
 fn push_u16(value: u16, out: &mut Vec<u8>) {
@@ -387,21 +423,23 @@ fn push_u32(value: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn table_size(input_len: usize) -> usize {
+fn match_table_size(input_len: usize) -> usize {
     input_len.next_power_of_two().clamp(1 << 12, 1 << 20)
 }
 
-fn hash_pair(a: u32, b: u32, mask: usize) -> usize {
+fn hash_two_values(a: u32, b: u32, mask: usize) -> usize {
     let mixed = ((a as u64) << 32) ^ b as u64;
     let hash = mixed.wrapping_mul(0x9e37_79b1_85eb_ca87);
     (hash as usize) & mask
 }
 
-struct HashTable {
+// Stores `position + 1`; zero means "no candidate". This avoids a separate
+// occupancy bitmap and keeps candidate 0 representable.
+struct MatchHashTable {
     entries: Vec<u32>,
 }
 
-impl HashTable {
+impl MatchHashTable {
     fn new(size: usize) -> Self {
         debug_assert!(size.is_power_of_two());
         Self {
@@ -427,16 +465,16 @@ mod tests {
     use super::*;
 
     fn u16s(bytes: &[u8]) -> Vec<u16> {
-        read_u16_stream(bytes)
+        read_le_u16_stream(bytes)
     }
 
     fn u32s(bytes: &[u8]) -> Vec<u32> {
-        read_u32_stream(bytes)
+        read_le_u32_stream(bytes)
     }
 
     #[test]
     fn parses_repeated_pair_as_expected() {
-        let streams = parse_u32(&[7, 8, 7, 8]).unwrap();
+        let streams = encode_u32_to_side_streams(&[7, 8, 7, 8]).unwrap();
         assert_eq!(u32s(&streams.literals), vec![7, 8]);
         assert_eq!(u16s(&streams.tokens), vec![0x004b]);
         assert_eq!(u32s(&streams.offsets), vec![2]);
@@ -446,7 +484,7 @@ mod tests {
 
     #[test]
     fn parses_repeated_run_as_expected() {
-        let streams = parse_u32(&[5, 5, 5, 5, 5]).unwrap();
+        let streams = encode_u32_to_side_streams(&[5, 5, 5, 5, 5]).unwrap();
         assert_eq!(u32s(&streams.literals), vec![5]);
         assert_eq!(u16s(&streams.tokens), vec![0x00c7]);
         assert_eq!(u32s(&streams.offsets), vec![1]);
@@ -457,8 +495,8 @@ mod tests {
     #[test]
     fn field_lz_round_trip_without_zstd() {
         let input = [1, 2, 1, 2, 1, 2, 9, 9, 9, 9, 3];
-        let streams = parse_u32(&input).unwrap();
-        let decoded = decode(streams.as_array(), input.len()).unwrap();
+        let streams = encode_u32_to_side_streams(&input).unwrap();
+        let decoded = decode_side_streams(streams.as_decode_inputs(), input.len()).unwrap();
         assert_eq!(le_bytes_to_u32s(&decoded).unwrap(), input);
     }
 
@@ -467,6 +505,6 @@ mod tests {
         let literals = 0u32.to_le_bytes();
         let token = 0x0400u16.to_le_bytes();
         let inputs = [&literals[..], &token[..], &[][..], &[][..], &[][..]];
-        assert!(decode(inputs, 1).is_err());
+        assert!(decode_side_streams(inputs, 1).is_err());
     }
 }
