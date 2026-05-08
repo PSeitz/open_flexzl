@@ -9,7 +9,7 @@
 //! decompress benches, so per-dataset ratios are visible without additional
 //! prints.
 
-use binggan::{black_box, BenchRunner};
+use binggan::{black_box, BenchRunner, OutputValue};
 use open_flexzl::{compress_u32, decompress_u32};
 
 #[path = "../tests/common/datasets.rs"]
@@ -33,6 +33,20 @@ struct Prepared {
     ofzl_frame: Vec<u8>,
     zstd_frame: Vec<u8>,
     openzl_frame: Vec<u8>,
+}
+
+struct CompressionRatio {
+    output_size: u64,
+    input_size: u64,
+}
+
+impl CompressionRatio {
+    fn new(output_size: usize, input_size: usize) -> Self {
+        Self {
+            output_size: output_size as u64,
+            input_size: input_size as u64,
+        }
+    }
 }
 
 fn main() {
@@ -70,13 +84,19 @@ fn main() {
         group.set_name(p.name);
         group.set_input_size(p.raw_size);
         group.register_with_input("ofzl", &p.data, |input| {
-            black_box(compress_u32(input).expect("ofzl encode")).len() as u64
+            let output_len = black_box(compress_u32(input).expect("ofzl encode")).len();
+            // Return output and input sizes in the OutputValue column for easy ratio visibility
+            // without extra prints.
+            CompressionRatio::new(output_len, input.len() * std::mem::size_of::<u32>())
         });
         group.register_with_input("zstd_on_raw", &p.raw_bytes, |bytes| {
-            black_box(zstd::bulk::compress(bytes, ZSTD_LEVEL).expect("zstd encode")).len() as u64
+            let output_len =
+                black_box(zstd::bulk::compress(bytes, ZSTD_LEVEL).expect("zstd encode")).len();
+            CompressionRatio::new(output_len, bytes.len())
         });
         group.register_with_input("openzl", &p.data, |input| {
-            black_box(openzl_compress(input)).len() as u64
+            let output_len = black_box(openzl_compress(input)).len();
+            CompressionRatio::new(output_len, input.len() * std::mem::size_of::<u32>())
         });
         group.run();
     }
@@ -103,9 +123,17 @@ fn main() {
         group.run();
     }
 }
+impl OutputValue for CompressionRatio {
+    fn format(&self) -> Option<String> {
+        let ratio = self.output_size as f64 / self.input_size as f64;
+        Some(format!("{:.2}%", ratio * 100.0))
+    }
+}
 
+#[allow(dead_code)]
 const ELEMENTS_PER_DATASET: usize = 1 << 16; // 64 KiB elements = 256 KiB raw
 
+#[allow(dead_code)]
 fn build_synthetic_datasets() -> Vec<(&'static str, Vec<u32>)> {
     let n = ELEMENTS_PER_DATASET;
 
