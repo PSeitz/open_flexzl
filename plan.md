@@ -30,7 +30,8 @@ Suggested next-session order:
 4. **OpenZL ratio gap is dominated by missing transforms, not the parser.** Initial dev-machine results: OpenZL gets 2185× on `monotonic` (delta transform → constant), OFZL gets 1.62× (same as raw zstd). OpenZL gets 2.28× on `all_unique` vs OFZL 1.41×. OpenZL gets 251× on `ten_value_cycle` vs OFZL 120×. On encode speed, OFZL is *often faster* than OpenZL — e.g. 6.6 vs 1.7 GB/s on `single_symbol_floods`, 1.27 vs 0.79 GB/s on `ten_value_cycle`, 643 vs 96 MB/s on `all_unique`. OFZL beats zstd on ratio for two datasets (`ten_value_cycle` 120× vs 106×, `synthetic_traces` 18.4× vs 16.8×); on the rest it's tied or slightly worse than zstd-on-raw.
 5. Stage-2 cleanup landed: hash-table insertion is now sparse (start+1, periodic mid-points, end-1) instead of every position, mirroring OpenZL's fast parser. Net effect on the listed datasets: +52% encode on `repeated_blocks` (6.9 → 10.5 GB/s), +26% on `low_cardinality`, +16% on `single_symbol_floods`, with a ~1% ratio cost on `ten_value_cycle` (135597 → 137027 bytes) where some phase-shift matches go unfound.
 6. Repeated-offset emission was prototyped (rep[0]-take-immediately) and reverted: the trade was poor (5–32% encode regression for 1–15% ratio wins on a few datasets) given the dominant gap is missing transforms.
-7. Stage 3 landed: the OpenZL `delta_int` transform (Standard Transform ID `1`, `value -> first_value + cumulative deltas`) sits *after* FieldLZ in the decode chain — FieldLZ regenerates a delta stream and `delta_int` undoes the delta with a prefix-sum. Encoder tries both the raw path and the delta path and keeps the smaller frame. Decoder validation now accepts the final chunk stream produced either by FieldLZ directly (raw path) or by a `delta_int` whose input is the FieldLZ output (delta path); either way exactly one FieldLZ transform per chunk. Realized impact on the bench: `monotonic` 161549 → **66 bytes** (1.62× → 3970×, *beats* OpenZL's 120 bytes); `all_unique` 961823 → 727951 (1.41× → 1.87×, OpenZL still ahead at 2.28×); other datasets pick the raw path so size is unchanged. Encode cost: ~2× on most data and up to 4× on tiny chunks where fixed overhead dominates; decode cost is unchanged on raw-path frames and slightly higher on delta-path frames due to the prefix-sum pass. Future work: a cheap "skip delta if obviously not worth it" heuristic to recover encode speed on data where delta never wins. Subsequent stages remain (b) byte-transposed literals + per-lane entropy and (c) FSE/Huffman side streams.
+7. Stage 3 landed: the OpenZL `delta_int` transform (Standard Transform ID `1`, `value -> first_value + cumulative deltas`) sits *after* FieldLZ in the decode chain — FieldLZ regenerates a delta stream and `delta_int` undoes the delta with a prefix-sum. Encoder tries both the raw path and the delta path and keeps the smaller frame. Decoder validation now accepts the final chunk stream produced either by FieldLZ directly (raw path) or by a `delta_int` whose input is the FieldLZ output (delta path); either way exactly one FieldLZ transform per chunk. Realized impact on the bench: `monotonic` 161549 → **66 bytes** (1.62× → 3970×, *beats* OpenZL's 120 bytes); `all_unique` 961823 → 727951 (1.41× → 1.87×, OpenZL still ahead at 2.28×); other datasets pick the raw path so size is unchanged. Encode cost: ~2× on most data and up to 4× on tiny chunks where fixed overhead dominates; decode cost is unchanged on raw-path frames and slightly higher on delta-path frames due to the prefix-sum pass. Future work: a cheap "skip delta if obviously not worth it" heuristic to recover encode speed on data where delta never wins.
+8. Side-stream route priority clarified: zstd already includes strong entropy coding, so native Huffman/FSE/bitpack should not be assumed to improve ratio enough to justify near-term complexity. Prioritize transforms that expose better structure *before* zstd — especially byte-transposed literal lanes and maybe offset/length quantization — then benchmark. Native entropy codecs remain lower-priority work for reduced per-stream overhead, faster decode, or OpenZL reference parity.
 
 ## Draft open-question recommendations
 
@@ -117,9 +118,9 @@ Add components without changing the outer frame/map:
 
 1. Faster FieldLZ parsers and repeated-offset emission.
 2. Compression/decompression level options and parser route selection policy.
-3. Literal transpose/split and literal selector routes if benchmarks show literal streams dominate.
-4. Quantize offsets/lengths (`25`, `26`) if zstd-on-raw side streams leaves meaningful ratio on the table.
-5. Bitpack/constant/Huffman/FSE routes only as long-term reference-parity work, not as first-version requirements.
+3. Literal transpose/split routes if benchmarks show literal streams dominate; first evaluate transposed lanes fed to zstd before implementing custom per-lane entropy codecs.
+4. Quantize offsets/lengths (`25`, `26`) if raw zstd side streams leave meaningful ratio on the table; quantization may help by exposing smaller code streams before zstd.
+5. Bitpack/constant/Huffman/FSE routes only as long-term speed/overhead/reference-parity work, not as first-version or near-term ratio requirements.
 
 ## Component inventory: reuse vs implement ourselves
 
@@ -149,13 +150,13 @@ Add components without changing the outer frame/map:
 - Repeated-offset encoder heuristics.
 - Offset and length quantizers.
 - Literal transpose/split and selector logic.
-- Bitpack/FSE/Huffman/constant transform contracts and route choices.
+- Bitpack/FSE/Huffman/constant transform contracts and route choices, with lower priority than structure-exposing transforms because zstd already provides strong entropy coding.
 
 These should be ports/adaptations into Rust-native code. Avoid linking the OpenZL C graph/runtime, because this crate deliberately does not target OpenZL frame compatibility or the OpenZL graph registry.
 
 ### Evaluate later, but do not assume reuse
 
-- Existing Rust bitpacking/FSE/Huffman crates. They are not needed for v1. If they are evaluated later, and if `open_flexzl` uses OpenZL standard transform IDs, the wire contract must match the transform contract we define. That likely means implementing small, deterministic native versions ourselves or wrapping libraries behind strict compatibility tests.
+- Existing Rust bitpacking/FSE/Huffman crates. They are not needed for v1 and should not be a near-term ratio assumption because zstd already covers strong entropy coding. If they are evaluated later for decode speed, stream overhead, or OpenZL parity, and if `open_flexzl` uses OpenZL standard transform IDs, the wire contract must match the transform contract we define. That likely means implementing small, deterministic native versions ourselves or wrapping libraries behind strict compatibility tests.
 
 ## Goal
 
@@ -177,8 +178,8 @@ The target is a Rust-native compressor focused on `u32` data, with a design that
 - The native frame should include a simple chunk-local decoding map with OpenZL-like transform IDs
 - A codec/transform interface is central to the compressor design; side-stream routing should be planned as transform chains
 - The first implementation milestone may route FieldLZ side streams through zstd, optionally using direct raw store for tiny streams; this bootstrap route is not a frame-format limitation
-- Track OpenZL’s reference side-stream routing, but do not implement FSE/Huffman/bitpack in v1; zstd side streams are good enough initially, so prioritize match-finder speed
-- Initial literal side-stream route: plain little-endian `u32` literals, likely zstd-compressed; byte-transposed literal lanes are tracked as a reference-parity optimization
+- Track OpenZL’s reference side-stream routing, but do not implement FSE/Huffman/bitpack in v1; zstd side streams are good enough initially, so prioritize match-finder speed and structure-exposing transforms before custom entropy codecs
+- Initial literal side-stream route: plain little-endian `u32` literals, likely zstd-compressed; byte-transposed literal lanes are tracked as a likely next ratio experiment because they can expose stable numeric high bytes before zstd
 - Default compression level for the public v1 API: `6`, matching OpenZL’s global default
 - FieldLZ token semantics should match OpenZL’s token/repeated-offset model
 - Large inputs should be chunked in the native frame; default chunk source size is `16 MiB`
@@ -659,18 +660,19 @@ OpenZL’s `EI_fieldLzDynGraph()` and helper graphs route FieldLZ side streams r
   - reference route: transpose/split fixed-width fields into byte lanes, then run a per-lane selector
   - selector options include store, constant, Huffman/delta-Huffman, zstd/delta-zstd depending on stats and compression/decompression levels
   - bootstrap route: plain literal stream through zstd
+  - near-term experiment: transpose/split byte lanes and feed those lanes to zstd first; this targets numeric data with stable high bytes without immediately reimplementing entropy codecs
 - tokens:
   - reference route: bitpack for small/fast-decode cases, otherwise Huffman
   - v1/bootstrap route: token stream through zstd or direct store for tiny streams
-  - bitpack/Huffman are not v1 requirements
+  - bitpack/Huffman are not near-term ratio requirements because zstd already entropy-codes the token bytes; revisit for per-stream overhead, decode speed, or OpenZL parity
 - offsets:
   - reference route: `quantize_offsets` into `u8` codes plus serial raw extra bits, then FSE or bitpack for codes and store/raw for extra bits
   - v1/bootstrap route: offsets stream through zstd or direct store for tiny streams
-  - quantize/FSE/bitpack are not v1 requirements
+  - near-term experiment: quantize offsets and then zstd the code/extra streams if offset streams are a measured ratio bottleneck; FSE/bitpack are not required for the first quantize experiment
 - extra literal lengths and extra match lengths:
   - reference route: `quantize_lengths` into `u8` codes plus serial raw extra bits, then FSE or bitpack for codes and store/raw for extra bits
   - v1/bootstrap route: length streams through zstd or direct store for tiny streams
-  - quantize/FSE/bitpack are not v1 requirements
+  - near-term experiment: quantize lengths only if length streams are large enough to matter; FSE/bitpack are not required for the first quantize experiment
 - small streams:
   - reference route: store streams whose byte size is below the configured minimum stream size (`ZL_MINSTREAMSIZE_DEFAULT = 10`, strict `< 10` in `EI_fieldLzDynGraph()`)
   - in this native map, direct store means the stored stream payload is already the raw bytes consumed by the next transform; no zstd transform is inserted for that stream
@@ -682,7 +684,7 @@ Quantize is not dictionary coding. It is a reversible integer split:
 value -> (small code, raw extra bits)
 ```
 
-For offsets, the code is essentially `floor(log2(value))`, and the extra bits store the low bits needed to reconstruct the exact offset. For lengths, values below 16 have direct codes, then the scheme switches to power-of-two buckets. The code stream is narrow (`u8`) and usually compresses well with FSE/bitpack/Huffman; the extra-bit stream is raw bit-packed data. This is reference-parity context only; v1 does not need these entropy codecs because zstd side streams are acceptable initially.
+For offsets, the code is essentially `floor(log2(value))`, and the extra bits store the low bits needed to reconstruct the exact offset. For lengths, values below 16 have direct codes, then the scheme switches to power-of-two buckets. The code stream is narrow (`u8`) and usually compresses well. First evaluate these structure-exposing splits with zstd-compressed code/extra streams; FSE/bitpack/Huffman are reference-parity or speed/overhead follow-ups, not prerequisites for trying quantize.
 
 Compression level and decompression level should eventually influence parser and side-stream route choices like OpenZL. The public no-options API uses compression level `6` and OpenZL default decompression level behavior unless/until options are added.
 
@@ -690,9 +692,10 @@ Compression level and decompression level should eventually influence parser and
 
 1. Required bootstrap transforms: zstd (`22`) and FieldLZ (`24`).
 2. Add direct stored-stream routing for streams below `DEFAULT_MIN_STREAM_SIZE` (`< 10` bytes), matching OpenZL’s small-stream route.
-3. Prioritize match-finder speed and benchmark results before adding more side-stream codecs.
-4. Add quantize offsets/lengths (`25`, `26`) later only if benchmarks show zstd-on-raw offset/length streams are a ratio bottleneck.
-5. Add bitpack/FSE/Huffman/constant and literal transpose/split/selector logic only as long-term reference-parity work, not v1 work.
+3. Prioritize benchmark-driven route choices before adding more side-stream codecs.
+4. Add literal transpose/split as the first likely side-stream ratio experiment, initially still feeding lanes to zstd.
+5. Add quantize offsets/lengths (`25`, `26`) later only if benchmarks show raw zstd offset/length streams are a ratio bottleneck; first try zstd over quantized code/extra streams.
+6. Add bitpack/FSE/Huffman/constant only as longer-term speed/overhead/reference-parity work, not v1 work and not a near-term ratio assumption.
 
 Adding a transform should add support for another `transform_id` and planner route; it should not require changing the FieldLZ token model or outer chunk map.
 
@@ -797,8 +800,9 @@ The side-stream codecs above are not non-goals for the whole project, but they a
 
 ## Deferred / tracked optimizations
 
-- Byte-transposed literal lanes: split the literal `u32` stream into four byte-position lanes and compress each lane separately. This is not zigzag and does not change values. It may improve ratio for numeric data with stable high bytes.
-- Non-zstd side-stream codecs and selectors, tracked in the reference side-stream routing section.
+- Byte-transposed literal lanes: split the literal `u32` stream into four byte-position lanes and compress each lane separately, initially with zstd. This is not zigzag and does not change values. It may improve ratio for numeric data with stable high bytes.
+- Quantized offset/length code+extra streams, initially with zstd over the split streams if benchmarks show these side streams dominate.
+- Non-zstd side-stream codecs and selectors, tracked in the reference side-stream routing section, lower priority than structure-exposing transforms because zstd already provides strong entropy coding.
 - Compression-level options, decompression-level options, and parser strategy options.
 
 ## v1 spec test vectors

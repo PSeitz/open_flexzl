@@ -16,5 +16,6 @@ let compressed = open_flexzl::compress_u32(&values)?;
 let decoded = open_flexzl::decompress_u32(&compressed)?;
 ```
 
-See [`plan.md`](plan.md) for the v1 frame, transform, match-finder, and
-implementation roadmap.
+See [`docs/compressor.md`](docs/compressor.md) for a current-vs-planned
+explanation of how compression works, and [`plan.md`](plan.md) for the v1 frame,
+transform, match-finder, and implementation roadmap.

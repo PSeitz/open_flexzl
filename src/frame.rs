@@ -435,28 +435,13 @@ fn execute_field_lz_transform(
         }
     }
 
-    let input_refs = [
-        slots[inputs[0]]
+    let mut input_refs = [&[][..]; FIELD_LZ_INPUT_COUNT];
+    for (input_ref, &stream_id) in input_refs.iter_mut().zip(inputs) {
+        *input_ref = slots[stream_id]
             .bytes
             .as_deref()
-            .ok_or(Error::InvalidMap("FieldLZ input 0 is undefined"))?,
-        slots[inputs[1]]
-            .bytes
-            .as_deref()
-            .ok_or(Error::InvalidMap("FieldLZ input 1 is undefined"))?,
-        slots[inputs[2]]
-            .bytes
-            .as_deref()
-            .ok_or(Error::InvalidMap("FieldLZ input 2 is undefined"))?,
-        slots[inputs[3]]
-            .bytes
-            .as_deref()
-            .ok_or(Error::InvalidMap("FieldLZ input 3 is undefined"))?,
-        slots[inputs[4]]
-            .bytes
-            .as_deref()
-            .ok_or(Error::InvalidMap("FieldLZ input 4 is undefined"))?,
-    ];
+            .ok_or(Error::InvalidMap("FieldLZ input stream is undefined"))?;
+    }
     let bytes = field_lz::decode_side_streams(input_refs, chunk_num_elements)?;
     Ok(TransformOutput {
         stream_id: outputs[0],
