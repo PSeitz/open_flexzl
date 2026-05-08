@@ -20,6 +20,101 @@ original values.
 routes such as byte-transposed literals, quantized offsets/lengths, and
 FSE/Huffman/bitpack-style entropy codecs.
 
+## Pipeline diagrams
+
+The compressor has two separate concerns: choose and serialize a chunk encoding,
+then describe how the decoder must replay that encoding. The first diagram is
+the compression path; the second is the decode program that the compressor writes.
+
+### Compression path
+
+```mermaid
+flowchart TD
+    A[compress_u32 input]
+    B[Split into chunks max 16 MiB]
+    C{Build chunk candidates}
+    D[Raw candidate uses original values]
+    E[Delta candidate computes wrapping deltas first]
+    F[FieldLZ parser finds u32 matches]
+    G1[Literals u32 values]
+    G2[Tokens u16 sequence codes]
+    G3[Offsets u32 match distances]
+    G4[Extra literal lengths u32]
+    G5[Extra match lengths u32]
+    H{Plan route for each side stream}
+    I[Raw payload for tiny streams]
+    J[Zstd payload and zstd transform record]
+    K[Optional literal transpose split four route]
+    L[Assemble chunk decode program]
+    M[Keep smaller raw or delta candidate]
+    N[OFZL frame header plus chunk programs]
+
+    A --> B
+    B --> C
+    C --> D
+    C --> E
+    D --> F
+    E --> F
+    F --> G1
+    F --> G2
+    F --> G3
+    F --> G4
+    F --> G5
+    G1 --> H
+    G2 --> H
+    G3 --> H
+    G4 --> H
+    G5 --> H
+    H --> I
+    H --> J
+    H --> K
+    I --> L
+    J --> L
+    K --> L
+    L --> M
+    M --> N
+```
+
+### Chunk decode program written by the compressor
+
+```mermaid
+flowchart TD
+    A[Chunk decode program]
+    B[Payload blobs raw or zstd bytes]
+    C[Transform records in decode order]
+    D[Record fields transform id input ids output ids private header]
+    E[Side stream recovery records]
+    F[zstd 22 and transpose_split4 31]
+    G[FieldLZ record field_lz 24 consumes five side streams]
+    H[FieldLZ rebuilds candidate chunk bytes]
+    I{Candidate was delta encoded}
+    J[delta_int 1 prefix sum rebuilds original values]
+    K[Final u32 chunk stream]
+
+    A --> B
+    A --> C
+    C --> D
+    D --> E
+    E --> F
+    B --> F
+    F --> G
+    D --> G
+    G --> H
+    H --> I
+    I --> J
+    I --> K
+    J --> K
+```
+
+The important idea is that compression writes a small decode program for each
+chunk. Delta is a compression-time candidate choice: the encoder computes
+wrapping deltas before FieldLZ parsing. If that candidate wins, the decode
+program later recovers side-stream bytes, runs `field_lz` to rebuild the delta
+bytes, then runs `delta_int` to prefix-sum those deltas back to the original
+values. The transform records are the central structure: they name the transform,
+which stream slots it reads and writes, and any private header bytes needed by
+that transform. Payload blobs are just backing bytes for the program.
+
 ## Public API
 
 **Current:** the crate exposes two profile-specific functions:
@@ -72,6 +167,7 @@ Supported transform IDs today:
 | `1` | `delta_int` | Current | Optional post-FieldLZ prefix-sum decode for delta-coded chunks. |
 | `22` | `zstd` | Current | Decompresses a stored magicless zstd side stream. |
 | `24` | `field_lz` | Current | Rebuilds a chunk from the five FieldLZ side streams. |
+| `31` | `transpose_split4` | Current | Recombines four literal byte lanes into a width-4 literal stream. |
 
 ## Compression pipeline
 
@@ -157,7 +253,7 @@ revisited after higher-impact transforms land.
 
 ### 4. Plan side-stream storage
 
-**Current:** each of the five FieldLZ side streams is routed independently:
+**Current:** each FieldLZ side stream still has a raw baseline route:
 
 ```text
 if side_stream.len() < 10 bytes:
@@ -166,25 +262,34 @@ else:
     store magicless zstd payload + add a zstd transform record
 ```
 
-This is direct small-stream store, not store-on-expansion. The encoder does not
-compare raw-vs-zstd for larger side streams; it uses zstd at compression level 6.
+The literal stream can also take a stats-gated byte-lane route:
+
+```text
+u32 literal bytes
+  -> split into four byte-position lanes
+  -> store/zstd each lane independently
+  -> transpose_split4 decode transform rebuilds the width-4 literal stream
+```
+
+The encoder only builds that candidate when cheap lane statistics suggest stable
+or low-cardinality byte lanes, and it still keeps the raw literal route unless
+the transposed route is smaller by a small safety margin. This is direct
+small-stream store, not store-on-expansion. The encoder does not compare raw-vs-zstd
+for larger side streams; it uses zstd at compression level 6.
 
 Magicless zstd frames are used because the transform map already identifies the
 payload as zstd. The zstd frame must include content size, and decode validates
 that the produced byte count matches it and is a multiple of the stream element
 width.
 
-**Planned / evaluate:** replace this bootstrap planner with richer OpenZL-style
-routes only where benchmarks show they beat plain zstd side streams. Zstd already
-includes entropy coding, so native Huffman/FSE-style codecs are not high-priority
-for ratio alone; they may still matter later for smaller per-stream overhead,
-faster decode, or reference parity.
+**Planned / evaluate:** add more OpenZL-style routes only where benchmarks show
+they beat plain zstd side streams. Zstd already includes entropy coding, so
+native Huffman/FSE-style codecs are not high-priority for ratio alone; they may
+still matter later for smaller per-stream overhead, faster decode, or reference
+parity.
 
 Likely priorities:
 
-- literals: split/transposed byte lanes, then usually zstd those lanes; this can
-  expose stable high bytes in numeric data better than a single interleaved
-  little-endian stream
 - offsets: evaluate quantizing into small bucket codes plus raw extra bits,
   because raw 32-bit offsets can be awkward for zstd when many matches exist
 - extra lengths: evaluate the same quantization idea, but only if length streams
@@ -192,6 +297,7 @@ Likely priorities:
 - tokens: keep zstd initially; bitpack/Huffman-style coding is mainly a later
   speed/overhead/parity experiment
 - optional store-on-expansion or route choices driven by compression options
+- literal selector refinements beyond the current byte-lane/zstd route
 
 The existing chunk map is intended to represent these future transform chains
 without changing the outer frame.

@@ -19,3 +19,9 @@ let decoded = open_flexzl::decompress_u32(&compressed)?;
 See [`docs/compressor.md`](docs/compressor.md) for a current-vs-planned
 explanation of how compression works, and [`plan.md`](plan.md) for the v1 frame,
 transform, match-finder, and implementation roadmap.
+
+### Benchmarks
+
+`cargo bench`
+
+To select a specific benchmark, use `cargo bench hot_head` or `cargo bench decompress`.

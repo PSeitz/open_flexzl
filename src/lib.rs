@@ -9,6 +9,7 @@ mod delta;
 mod error;
 mod field_lz;
 mod frame;
+mod transpose;
 mod varint;
 mod zstd_codec;
 
