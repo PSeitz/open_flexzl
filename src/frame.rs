@@ -23,11 +23,7 @@ const FIELD_LZ_INPUT_WIDTHS: [usize; FIELD_LZ_INPUT_COUNT] =
     [U32_WIDTH, U16_WIDTH, U32_WIDTH, U32_WIDTH, U32_WIDTH];
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
-    let chunk_count = if input.is_empty() {
-        0
-    } else {
-        input.len().div_ceil(MAX_CHUNK_ELEMENTS_U32)
-    };
+    let chunk_count = input.len().div_ceil(MAX_CHUNK_ELEMENTS_U32);
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -101,8 +97,9 @@ pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
 }
 
 fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Result<(), Error> {
-    if chunk.is_empty() || chunk.len() > MAX_CHUNK_ELEMENTS_U32 {
-        return Err(Error::InvalidFrame("invalid chunk element count"));
+    debug_assert!(!chunk.is_empty());
+    if chunk.len() > MAX_CHUNK_ELEMENTS_U32 {
+        return Err(Error::InvalidFrame("chunk element count exceeds maximum"));
     }
 
     // Candidate 1: FieldLZ parses the original values and its output is the
