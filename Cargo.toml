@@ -10,7 +10,7 @@ zstd = { version = "0.13", features = ["experimental"] }
 
 [dev-dependencies]
 proptest = "1"
-binggan = { path = "../binggan/" }
+binggan = "0.17"
 rust-openzl = "0.1"
 
 [[bench]]
