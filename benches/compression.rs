@@ -87,7 +87,7 @@ fn main() {
         let mut group = runner.new_group();
         group.set_name(p.name);
         group.set_input_size(p.raw_size);
-        group.register_with_input("ofzl", &p.data, |input| {
+        group.register_with_input("open_flexzl", &p.data, |input| {
             let output_len = black_box(compress_u32(input).expect("ofzl encode")).len();
             // Return output and input sizes in the OutputValue column for easy ratio visibility
             // without extra prints.
@@ -111,7 +111,7 @@ fn main() {
         let mut group = runner.new_group();
         group.set_name(p.name);
         group.set_input_size(p.raw_size);
-        group.register_with_input("ofzl", &p.ofzl_frame, |frame| {
+        group.register_with_input("open_flexzl", &p.ofzl_frame, |frame| {
             // Return decoded byte count (not element count) so the OutputValue
             // column is comparable to the other benches in this group.
             let decoded = black_box(decompress_u32(frame).expect("ofzl decode"));
