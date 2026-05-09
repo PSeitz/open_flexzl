@@ -59,6 +59,12 @@ fn main() {
     for ds in real_world::load_representative_set() {
         datasets.push((ds.label, ds.values));
     }
+    // Add a dataset concatenating all the real-world datasets together, to see how the compressors
+    // do on a larger input with more varied content.
+    datasets.push((
+        "all_real_world_concatenated",
+        datasets.iter().flat_map(|(_, data)| data.clone()).collect(),
+    ));
 
     let prepared: Vec<Prepared> = datasets
         .into_iter()
