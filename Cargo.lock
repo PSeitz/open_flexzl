@@ -52,8 +52,6 @@ dependencies = [
 [[package]]
 name = "binggan"
 version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22ded5d4d31b90cfa2d9d28716767d4951e35e0c2a4f55c0c636ef58e577306"
 dependencies = [
  "alloca",
  "bpu_trasher",

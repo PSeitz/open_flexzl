@@ -47,6 +47,10 @@ impl CompressionRatio {
             input_size: input_size as u64,
         }
     }
+
+    fn ratio(&self) -> f64 {
+        self.output_size as f64 / self.input_size as f64
+    }
 }
 
 fn main() {
@@ -78,7 +82,7 @@ fn main() {
 
     let mut runner = BenchRunner::new();
 
-    runner.set_name("compression");
+    runner.set_name("data_compression");
     for p in &prepared {
         let mut group = runner.new_group();
         group.set_name(p.name);
@@ -101,7 +105,7 @@ fn main() {
         group.run();
     }
 
-    runner.set_name("decompression");
+    runner.set_name("data_decompression");
     for p in &prepared {
         let raw_size = p.raw_size;
         let mut group = runner.new_group();
@@ -125,8 +129,38 @@ fn main() {
 }
 impl OutputValue for CompressionRatio {
     fn format(&self) -> Option<String> {
-        let ratio = self.output_size as f64 / self.input_size as f64;
-        Some(format!("{:.2}%", ratio * 100.0))
+        Some(format!("{:.2}%", self.ratio() * 100.0))
+    }
+
+    fn column_title() -> &'static str {
+        "Output"
+    }
+
+    fn serialize(&self) -> Option<String> {
+        Some(format!("{},{}", self.output_size, self.input_size))
+    }
+
+    fn deserialize(serialized: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let (output_size, input_size) = serialized.split_once(',')?;
+        Some(Self {
+            output_size: output_size.parse().ok()?,
+            input_size: input_size.parse().ok()?,
+        })
+    }
+
+    fn format_delta(&self, old: &Self) -> Option<String>
+    where
+        Self: Sized,
+    {
+        let old_ratio = old.ratio();
+        let new_ratio = self.ratio();
+        if old_ratio == 0.0 || old_ratio == new_ratio {
+            return Some("(+0%)".to_string());
+        }
+        Some(format!("({:+.2}%)", (new_ratio / old_ratio - 1.0) * 100.0))
     }
 }
 

@@ -2,7 +2,6 @@
 name = "open_flexzl"
 version = "0.1.0"
 edition = "2021"
-license = "BSD-3-Clause"
 description = "Rust-native fixed-width numeric compression inspired by OpenZL, initially focused on u32."
 
 [dependencies]
@@ -11,7 +10,7 @@ zstd = { version = "0.13", features = ["experimental"] }
 
 [dev-dependencies]
 proptest = "1"
-binggan = "0.16"
+binggan = { path = "../binggan/" }
 rust-openzl = "0.1"
 
 [[bench]]
