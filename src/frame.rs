@@ -699,8 +699,9 @@ fn choose_smallest_chunk_encoding(
     baseline: &RawFieldLzBaseline,
     strategies: &[&dyn ChunkEncodingStrategy],
 ) -> Result<Vec<u8>, Error> {
+    let context = CandidateSelectionContext { analysis, baseline };
     for strategy in strategies {
-        if strategy.should_build(analysis, baseline) {
+        if strategy.should_build(chunk, &context)? {
             let candidate = strategy.encode_chunk(chunk)?;
             if candidate.len() < best_encoding.len() {
                 best_encoding = candidate;
@@ -710,8 +711,17 @@ fn choose_smallest_chunk_encoding(
     Ok(best_encoding)
 }
 
+struct CandidateSelectionContext<'a> {
+    analysis: &'a ChunkValueAnalysis,
+    baseline: &'a RawFieldLzBaseline,
+}
+
 trait ChunkEncodingStrategy {
-    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool;
+    fn should_build(
+        &self,
+        chunk: &[u32],
+        context: &CandidateSelectionContext<'_>,
+    ) -> Result<bool, Error>;
     fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error>;
 }
 
@@ -740,42 +750,96 @@ impl Ratio {
     fn is_above(&self, count: usize, total: usize) -> bool {
         count * self.denominator < total * self.numerator
     }
+
+    fn reduced_by_at_least(&self, reduced: usize, original: usize) -> bool {
+        let saved = original.saturating_sub(reduced);
+        saved * self.denominator >= original * self.numerator
+    }
+}
+
+fn should_build_delta_from_samples(chunk: &[u32]) -> Result<bool, Error> {
+    if chunk.len() < DELTA_SAMPLE_MIN_ELEMENTS {
+        return Ok(true);
+    }
+
+    let mut sampled_raw_len = 0usize;
+    let mut sampled_delta_len = 0usize;
+    for (start, end) in delta_sample_ranges(chunk.len()) {
+        let sample = &chunk[start..end];
+        sampled_raw_len += serialize_chunk_encoding_candidate(sample.len(), sample, false)?.len();
+
+        let deltas = delta::encode_u32_deltas(sample);
+        sampled_delta_len += serialize_chunk_encoding_candidate(sample.len(), &deltas, true)?.len();
+    }
+
+    Ok(DELTA_SAMPLE_MIN_SIZE_GAIN.reduced_by_at_least(sampled_delta_len, sampled_raw_len))
+}
+
+fn delta_sample_ranges(element_count: usize) -> impl Iterator<Item = (usize, usize)> {
+    let sample_len = DELTA_SAMPLE_LEN.min(element_count);
+    let sample_count = DELTA_SAMPLE_COUNT.min(element_count.div_ceil(sample_len));
+    (0..sample_count).map(move |index| {
+        let start = if sample_count == 1 {
+            0
+        } else {
+            index * (element_count - sample_len) / (sample_count - 1)
+        };
+        (start, start + sample_len)
+    })
 }
 
 struct DeltaIntFieldLzStrategy;
 
+const DELTA_SAMPLE_MIN_ELEMENTS: usize = 16 * 1024;
+const DELTA_SAMPLE_LEN: usize = 2 * 1024;
+const DELTA_SAMPLE_COUNT: usize = 2;
+const DELTA_SAMPLE_MIN_SIZE_GAIN: Ratio = Ratio::new(3, 5);
+
 impl ChunkEncodingStrategy for DeltaIntFieldLzStrategy {
-    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool {
+    fn should_build(
+        &self,
+        chunk: &[u32],
+        context: &CandidateSelectionContext<'_>,
+    ) -> Result<bool, Error> {
+        let analysis = context.analysis;
+        let baseline = context.baseline;
+
         if analysis.element_count < 2 {
-            return false;
+            return Ok(false);
         }
 
         // If raw FieldLZ is already below 1% of the source bytes, delta can only
         // save a tiny absolute amount and usually adds graph overhead.
         if baseline.encoded_len <= baseline.source_byte_len / 100 {
-            return false;
+            return Ok(false);
         }
 
         // Long runs of identical values are already exactly what the raw FieldLZ
         // path handles well; delta mostly turns them into zero runs with extra
         // graph overhead.
         if analysis.equal_value_pairs * 4 >= analysis.element_count {
-            return false;
+            return Ok(false);
         }
 
         // Constant or mostly-constant strides are the strongest signal for
-        // delta_int.
+        // delta_int; build the full candidate without spending extra sampling
+        // work to confirm it.
         if analysis.equal_delta_pairs * 2 >= analysis.element_count {
-            return true;
+            return Ok(true);
         }
 
-        // Otherwise, try delta only when it creates substantially more
-        // 16-bit-ish values than the raw stream. Those high bytes become cheap
-        // literals for zstd and are where delta helped the real mostly/all-
-        // unique datasets.
+        // Otherwise, compact deltas are only a size signal. Before paying for a
+        // complete second FieldLZ + zstd candidate, sample a few sub-slices and
+        // require a large projected size win. This keeps all-unique/wide data
+        // from taking the slow delta path for a modest ratio-only improvement.
         let min_compact_gain = (analysis.element_count / 4).max(1);
-        analysis.compact_delta_16 * 2 >= analysis.element_count
-            && analysis.compact_delta_16 >= analysis.compact_value_16 + min_compact_gain
+        let has_compact_delta_signal = analysis.compact_delta_16 * 2 >= analysis.element_count
+            && analysis.compact_delta_16 >= analysis.compact_value_16 + min_compact_gain;
+        if !has_compact_delta_signal {
+            return Ok(false);
+        }
+
+        should_build_delta_from_samples(chunk)
     }
 
     fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error> {
@@ -951,6 +1015,34 @@ mod tests {
         let zstd_magic = [0x28, 0xb5, 0x2f, 0xfd];
         assert!(!frame.windows(zstd_magic.len()).any(|w| w == zstd_magic));
         assert_eq!(decompress_u32(&frame).unwrap(), vec![0x1122_3344]);
+    }
+
+    #[test]
+    fn delta_sample_ranges_are_bounded_and_spread() {
+        let ranges: Vec<_> = delta_sample_ranges(20_000).collect();
+        assert_eq!(ranges.len(), DELTA_SAMPLE_COUNT);
+        assert_eq!(ranges[0], (0, DELTA_SAMPLE_LEN));
+        assert_eq!(ranges[1], (20_000 - DELTA_SAMPLE_LEN, 20_000));
+        assert!(ranges.iter().all(|&(start, end)| start < end && end <= 20_000));
+    }
+
+    #[test]
+    fn delta_sampling_keeps_strong_constant_stride_signal() {
+        let input: Vec<u32> = (0..20_000u32).map(|i| 1_200_000 + i * 37).collect();
+        let analysis = ChunkValueAnalysis::scan_u32(&input);
+        let raw_candidate = serialize_chunk_encoding_candidate(input.len(), &input, false).unwrap();
+        let baseline = RawFieldLzBaseline {
+            encoded_len: raw_candidate.len(),
+            source_byte_len: input.len() * U32_WIDTH,
+        };
+        let context = CandidateSelectionContext {
+            analysis: &analysis,
+            baseline: &baseline,
+        };
+
+        assert!(DELTA_INT_FIELD_LZ_STRATEGY
+            .should_build(&input, &context)
+            .unwrap());
     }
 
     #[test]
