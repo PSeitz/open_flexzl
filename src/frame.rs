@@ -168,7 +168,7 @@ fn serialize_field_lz_side_streams(
     append_delta_transform: bool,
 ) -> Result<Vec<u8>, Error> {
     let plan =
-        plan_field_lz_side_stream_graph(streams, chunk_num_elements, append_delta_transform)?;
+        build_field_lz_side_stream_graph(streams, chunk_num_elements, append_delta_transform)?;
 
     let mut r = Vec::new();
     varint::write_usize(chunk_num_elements, &mut r);
@@ -531,7 +531,7 @@ fn validate_transform_input_stream_id(stream_id: usize, slots: &[StreamSlot]) ->
     Ok(())
 }
 
-fn plan_field_lz_side_stream_graph(
+fn build_field_lz_side_stream_graph(
     streams: &FieldLzSideStreams,
     chunk_num_elements: usize,
     append_delta_transform: bool,
@@ -549,7 +549,7 @@ fn plan_field_lz_side_stream_graph(
     let mut field_lz_inputs = Vec::with_capacity(FIELD_LZ_INPUT_COUNT);
     let mut next_stream_id = 0usize;
 
-    let literal_route = plan_literal_side_stream_route(side_streams[0], next_stream_id)?;
+    let literal_route = encode_literal_side_stream_route(side_streams[0], next_stream_id)?;
     next_stream_id = literal_route.next_stream_id;
     field_lz_inputs.push(literal_route.output_stream_id);
     append_side_stream_route(literal_route, &mut stored_streams, &mut transforms);
@@ -558,7 +558,7 @@ fn plan_field_lz_side_stream_graph(
         .iter()
         .zip(FIELD_LZ_INPUT_WIDTHS[1..].iter())
     {
-        let route = plan_raw_side_stream_route(bytes, *width, next_stream_id)?;
+        let route = encode_raw_side_stream_route(bytes, *width, next_stream_id)?;
         next_stream_id = route.next_stream_id;
         field_lz_inputs.push(route.output_stream_id);
         append_side_stream_route(route, &mut stored_streams, &mut transforms);
@@ -598,17 +598,17 @@ fn plan_field_lz_side_stream_graph(
     })
 }
 
-fn plan_literal_side_stream_route(
+fn encode_literal_side_stream_route(
     bytes: &[u8],
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
     if transpose::should_try_literal_split4(bytes) {
         return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
     }
-    plan_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
+    encode_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
 }
 
-fn plan_raw_side_stream_route(
+fn encode_raw_side_stream_route(
     bytes: &[u8],
     element_width: usize,
     next_stream_id: usize,
@@ -656,7 +656,7 @@ fn build_transposed_literal_side_stream_candidate(
     let mut lane_stream_ids = Vec::with_capacity(U32_WIDTH);
 
     for lane in &lanes {
-        let route = plan_raw_side_stream_route(lane, 1, next_stream_id)?;
+        let route = encode_raw_side_stream_route(lane, 1, next_stream_id)?;
         next_stream_id = route.next_stream_id;
         lane_stream_ids.push(route.output_stream_id);
         append_side_stream_route(route, &mut stored_streams, &mut transforms);
@@ -1052,7 +1052,7 @@ mod tests {
             literals: field_lz::u32s_to_le_bytes(&input),
             ..FieldLzSideStreams::default()
         };
-        let plan = plan_field_lz_side_stream_graph(&streams, input.len(), false).unwrap();
+        let plan = build_field_lz_side_stream_graph(&streams, input.len(), false).unwrap();
         assert!(plan
             .transforms
             .iter()
