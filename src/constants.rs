@@ -19,7 +19,7 @@ pub(crate) const U32_WIDTH: usize = 4;
 pub(crate) const U16_WIDTH: usize = 2;
 pub(crate) const MAX_CHUNK_ELEMENTS_U32: usize = MAX_CHUNK_BYTES / U32_WIDTH;
 pub(crate) const MAX_OFFSET_ELEMENTS: usize = MAX_CHUNK_ELEMENTS_U32 - 1;
-pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 6;
+pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 2;
 pub(crate) const DEFAULT_MIN_STREAM_SIZE: usize = 10;
 
 pub(crate) const RUNTIME_TRANSFORM_INPUT_LIMIT: usize = 2_048;

@@ -155,12 +155,12 @@ impl OutputValue for CompressionRatio {
     where
         Self: Sized,
     {
-        let old_ratio = old.ratio();
-        let new_ratio = self.ratio();
-        if old_ratio == 0.0 || old_ratio == new_ratio {
+        let old_percentage = old.ratio() * 100.0;
+        let new_percentage = self.ratio() * 100.0;
+        if old_percentage == new_percentage {
             return Some("(+0%)".to_string());
         }
-        Some(format!("({:+.2}%)", (new_ratio / old_ratio - 1.0) * 100.0))
+        Some(format!("({:+.2}%)", new_percentage - old_percentage))
     }
 }
 
