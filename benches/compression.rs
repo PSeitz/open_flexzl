@@ -47,6 +47,10 @@ impl CompressionRatio {
             input_size: input_size as u64,
         }
     }
+
+    fn ratio(&self) -> f64 {
+        self.output_size as f64 / self.input_size as f64
+    }
 }
 
 fn main() {
@@ -55,6 +59,12 @@ fn main() {
     for ds in real_world::load_representative_set() {
         datasets.push((ds.label, ds.values));
     }
+    // Add a dataset concatenating all the real-world datasets together, to see how the compressors
+    // do on a larger input with more varied content.
+    datasets.push((
+        "all_real_world_concatenated",
+        datasets.iter().flat_map(|(_, data)| data.clone()).collect(),
+    ));
 
     let prepared: Vec<Prepared> = datasets
         .into_iter()
@@ -78,12 +88,12 @@ fn main() {
 
     let mut runner = BenchRunner::new();
 
-    runner.set_name("compression");
+    runner.set_name("data_compression");
     for p in &prepared {
         let mut group = runner.new_group();
         group.set_name(p.name);
         group.set_input_size(p.raw_size);
-        group.register_with_input("ofzl", &p.data, |input| {
+        group.register_with_input("open_flexzl", &p.data, |input| {
             let output_len = black_box(compress_u32(input).expect("ofzl encode")).len();
             // Return output and input sizes in the OutputValue column for easy ratio visibility
             // without extra prints.
@@ -101,13 +111,13 @@ fn main() {
         group.run();
     }
 
-    runner.set_name("decompression");
+    runner.set_name("data_decompression");
     for p in &prepared {
         let raw_size = p.raw_size;
         let mut group = runner.new_group();
         group.set_name(p.name);
         group.set_input_size(p.raw_size);
-        group.register_with_input("ofzl", &p.ofzl_frame, |frame| {
+        group.register_with_input("open_flexzl", &p.ofzl_frame, |frame| {
             // Return decoded byte count (not element count) so the OutputValue
             // column is comparable to the other benches in this group.
             let decoded = black_box(decompress_u32(frame).expect("ofzl decode"));
@@ -125,8 +135,38 @@ fn main() {
 }
 impl OutputValue for CompressionRatio {
     fn format(&self) -> Option<String> {
-        let ratio = self.output_size as f64 / self.input_size as f64;
-        Some(format!("{:.2}%", ratio * 100.0))
+        Some(format!("{:.2}%", self.ratio() * 100.0))
+    }
+
+    fn column_title() -> &'static str {
+        "Output"
+    }
+
+    fn serialize(&self) -> Option<String> {
+        Some(format!("{},{}", self.output_size, self.input_size))
+    }
+
+    fn deserialize(serialized: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let (output_size, input_size) = serialized.split_once(',')?;
+        Some(Self {
+            output_size: output_size.parse().ok()?,
+            input_size: input_size.parse().ok()?,
+        })
+    }
+
+    fn format_delta(&self, old: &Self) -> Option<String>
+    where
+        Self: Sized,
+    {
+        let old_percentage = old.ratio() * 100.0;
+        let new_percentage = self.ratio() * 100.0;
+        if old_percentage == new_percentage {
+            return Some("(+0%)".to_string());
+        }
+        Some(format!("({:+.2}%)", new_percentage - old_percentage))
     }
 }
 

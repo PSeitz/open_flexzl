@@ -123,25 +123,15 @@ fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Res
         return Ok(());
     }
 
-    // Candidate 1: FieldLZ parses the original values and its output is the
-    // final chunk stream. We always need this as the fallback encoding.
-    let raw_candidate = serialize_chunk_encoding_candidate(chunk.len(), chunk, false)?;
-
-    // Encoder strategies decide whether another complete chunk encoding is
-    // worth building before paying for another FieldLZ parse plus side-stream
-    // zstd encodes.
-    let baseline = RawFieldLzBaseline {
-        encoded_len: raw_candidate.len(),
-        source_byte_len: chunk.len() * U32_WIDTH,
+    // From here on, route selection must choose exactly one full encoding.
+    // Sampling is allowed, but we do not build both raw and delta full-chunk
+    // candidates just to compare them.
+    let chunk_bytes = if DELTA_INT_FIELD_LZ_STRATEGY.should_build(chunk, &analysis)? {
+        DELTA_INT_FIELD_LZ_STRATEGY.encode_chunk(chunk)?
+    } else {
+        serialize_chunk_encoding_candidate(chunk.len(), chunk, false)?
     };
-    let best_chunk_bytes = choose_smallest_chunk_encoding(
-        chunk,
-        raw_candidate,
-        &analysis,
-        &baseline,
-        &[&DELTA_INT_FIELD_LZ_STRATEGY],
-    )?;
-    out.extend_from_slice(&best_chunk_bytes);
+    out.extend_from_slice(&chunk_bytes);
     Ok(())
 }
 
@@ -168,7 +158,7 @@ fn serialize_field_lz_side_streams(
     append_delta_transform: bool,
 ) -> Result<Vec<u8>, Error> {
     let plan =
-        plan_field_lz_side_stream_graph(streams, chunk_num_elements, append_delta_transform)?;
+        build_field_lz_side_stream_graph(streams, chunk_num_elements, append_delta_transform)?;
 
     let mut r = Vec::new();
     varint::write_usize(chunk_num_elements, &mut r);
@@ -531,7 +521,7 @@ fn validate_transform_input_stream_id(stream_id: usize, slots: &[StreamSlot]) ->
     Ok(())
 }
 
-fn plan_field_lz_side_stream_graph(
+fn build_field_lz_side_stream_graph(
     streams: &FieldLzSideStreams,
     chunk_num_elements: usize,
     append_delta_transform: bool,
@@ -549,7 +539,7 @@ fn plan_field_lz_side_stream_graph(
     let mut field_lz_inputs = Vec::with_capacity(FIELD_LZ_INPUT_COUNT);
     let mut next_stream_id = 0usize;
 
-    let literal_route = plan_literal_side_stream_route(side_streams[0], next_stream_id)?;
+    let literal_route = encode_literal_side_stream_route(side_streams[0], next_stream_id)?;
     next_stream_id = literal_route.next_stream_id;
     field_lz_inputs.push(literal_route.output_stream_id);
     append_side_stream_route(literal_route, &mut stored_streams, &mut transforms);
@@ -558,7 +548,7 @@ fn plan_field_lz_side_stream_graph(
         .iter()
         .zip(FIELD_LZ_INPUT_WIDTHS[1..].iter())
     {
-        let route = plan_raw_side_stream_route(bytes, *width, next_stream_id)?;
+        let route = encode_raw_side_stream_route(bytes, *width, next_stream_id)?;
         next_stream_id = route.next_stream_id;
         field_lz_inputs.push(route.output_stream_id);
         append_side_stream_route(route, &mut stored_streams, &mut transforms);
@@ -598,17 +588,17 @@ fn plan_field_lz_side_stream_graph(
     })
 }
 
-fn plan_literal_side_stream_route(
+fn encode_literal_side_stream_route(
     bytes: &[u8],
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
     if transpose::should_try_literal_split4(bytes) {
         return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
     }
-    plan_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
+    encode_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
 }
 
-fn plan_raw_side_stream_route(
+fn encode_raw_side_stream_route(
     bytes: &[u8],
     element_width: usize,
     next_stream_id: usize,
@@ -656,7 +646,7 @@ fn build_transposed_literal_side_stream_candidate(
     let mut lane_stream_ids = Vec::with_capacity(U32_WIDTH);
 
     for lane in &lanes {
-        let route = plan_raw_side_stream_route(lane, 1, next_stream_id)?;
+        let route = encode_raw_side_stream_route(lane, 1, next_stream_id)?;
         next_stream_id = route.next_stream_id;
         lane_stream_ids.push(route.output_stream_id);
         append_side_stream_route(route, &mut stored_streams, &mut transforms);
@@ -692,32 +682,9 @@ fn append_side_stream_route(
 
 static DELTA_INT_FIELD_LZ_STRATEGY: DeltaIntFieldLzStrategy = DeltaIntFieldLzStrategy;
 
-fn choose_smallest_chunk_encoding(
-    chunk: &[u32],
-    mut best_encoding: Vec<u8>,
-    analysis: &ChunkValueAnalysis,
-    baseline: &RawFieldLzBaseline,
-    strategies: &[&dyn ChunkEncodingStrategy],
-) -> Result<Vec<u8>, Error> {
-    for strategy in strategies {
-        if strategy.should_build(analysis, baseline) {
-            let candidate = strategy.encode_chunk(chunk)?;
-            if candidate.len() < best_encoding.len() {
-                best_encoding = candidate;
-            }
-        }
-    }
-    Ok(best_encoding)
-}
-
 trait ChunkEncodingStrategy {
-    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool;
+    fn should_build(&self, chunk: &[u32], analysis: &ChunkValueAnalysis) -> Result<bool, Error>;
     fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error>;
-}
-
-struct RawFieldLzBaseline {
-    encoded_len: usize,
-    source_byte_len: usize,
 }
 
 struct Ratio {
@@ -742,40 +709,79 @@ impl Ratio {
     }
 }
 
+fn should_build_delta_from_samples(chunk: &[u32]) -> Result<bool, Error> {
+    if chunk.len() < DELTA_SAMPLE_MIN_ELEMENTS {
+        return Ok(true);
+    }
+
+    let mut sampled_raw_len = 0usize;
+    let mut sampled_delta_len = 0usize;
+    for (start, end) in delta_sample_ranges(chunk.len()) {
+        let sample = &chunk[start..end];
+        let raw_bytes = field_lz::u32s_to_le_bytes(sample);
+        sampled_raw_len +=
+            zstd_codec::encode_magicless(&raw_bytes, DEFAULT_COMPRESSION_LEVEL)?.len();
+
+        let deltas = delta::encode_u32_deltas(sample);
+        let delta_bytes = field_lz::u32s_to_le_bytes(&deltas);
+        sampled_delta_len +=
+            zstd_codec::encode_magicless(&delta_bytes, DEFAULT_COMPRESSION_LEVEL)?.len();
+    }
+
+    Ok(sampled_delta_len < sampled_raw_len)
+}
+
+fn delta_sample_ranges(element_count: usize) -> impl Iterator<Item = (usize, usize)> {
+    let sample_len = DELTA_SAMPLE_LEN.min(element_count);
+    let sample_count = DELTA_SAMPLE_COUNT.min(element_count.div_ceil(sample_len));
+    (0..sample_count).map(move |index| {
+        let start = if sample_count == 1 {
+            (element_count - sample_len) / 2
+        } else {
+            index * (element_count - sample_len) / (sample_count - 1)
+        };
+        (start, start + sample_len)
+    })
+}
+
 struct DeltaIntFieldLzStrategy;
 
-impl ChunkEncodingStrategy for DeltaIntFieldLzStrategy {
-    fn should_build(&self, analysis: &ChunkValueAnalysis, baseline: &RawFieldLzBaseline) -> bool {
-        if analysis.element_count < 2 {
-            return false;
-        }
+const DELTA_SAMPLE_MIN_ELEMENTS: usize = 16 * 1024;
+const DELTA_SAMPLE_LEN: usize = 4 * 1024;
+const DELTA_SAMPLE_COUNT: usize = 1;
 
-        // If raw FieldLZ is already below 1% of the source bytes, delta can only
-        // save a tiny absolute amount and usually adds graph overhead.
-        if baseline.encoded_len <= baseline.source_byte_len / 100 {
-            return false;
+impl ChunkEncodingStrategy for DeltaIntFieldLzStrategy {
+    fn should_build(&self, chunk: &[u32], analysis: &ChunkValueAnalysis) -> Result<bool, Error> {
+        if analysis.element_count < 2 {
+            return Ok(false);
         }
 
         // Long runs of identical values are already exactly what the raw FieldLZ
         // path handles well; delta mostly turns them into zero runs with extra
         // graph overhead.
         if analysis.equal_value_pairs * 4 >= analysis.element_count {
-            return false;
+            return Ok(false);
         }
 
         // Constant or mostly-constant strides are the strongest signal for
-        // delta_int.
+        // delta_int; build the full candidate without spending extra sampling
+        // work to confirm it.
         if analysis.equal_delta_pairs * 2 >= analysis.element_count {
-            return true;
+            return Ok(true);
         }
 
-        // Otherwise, try delta only when it creates substantially more
-        // 16-bit-ish values than the raw stream. Those high bytes become cheap
-        // literals for zstd and are where delta helped the real mostly/all-
-        // unique datasets.
+        // Otherwise, compact deltas are only a size signal. Before paying for a
+        // complete second FieldLZ + zstd candidate, sample a few sub-slices with
+        // raw zstd bytes and build the full delta candidate only when sampled
+        // delta bytes are smaller than sampled raw bytes.
         let min_compact_gain = (analysis.element_count / 4).max(1);
-        analysis.compact_delta_16 * 2 >= analysis.element_count
-            && analysis.compact_delta_16 >= analysis.compact_value_16 + min_compact_gain
+        let has_compact_delta_signal = analysis.compact_delta_16 * 2 >= analysis.element_count
+            && analysis.compact_delta_16 >= analysis.compact_value_16 + min_compact_gain;
+        if !has_compact_delta_signal {
+            return Ok(false);
+        }
+
+        should_build_delta_from_samples(chunk)
     }
 
     fn encode_chunk(&self, chunk: &[u32]) -> Result<Vec<u8>, Error> {
@@ -954,13 +960,40 @@ mod tests {
     }
 
     #[test]
+    fn delta_sample_ranges_are_bounded_and_spread() {
+        let element_count = 200_000;
+        let ranges: Vec<_> = delta_sample_ranges(element_count).collect();
+        assert_eq!(ranges.len(), DELTA_SAMPLE_COUNT);
+        assert_eq!(
+            ranges[0],
+            (
+                (element_count - DELTA_SAMPLE_LEN) / 2,
+                (element_count + DELTA_SAMPLE_LEN) / 2
+            )
+        );
+        assert!(ranges
+            .iter()
+            .all(|&(start, end)| start < end && end <= element_count));
+    }
+
+    #[test]
+    fn delta_sampling_keeps_strong_constant_stride_signal() {
+        let input: Vec<u32> = (0..20_000u32).map(|i| 1_200_000 + i * 37).collect();
+        let analysis = ChunkValueAnalysis::scan_u32(&input);
+
+        assert!(DELTA_INT_FIELD_LZ_STRATEGY
+            .should_build(&input, &analysis)
+            .unwrap());
+    }
+
+    #[test]
     fn transposed_literal_route_round_trips_when_selected() {
         let input: Vec<u32> = (0..4096).map(|i| ((i * 37) & 0xffff) as u32).collect();
         let streams = FieldLzSideStreams {
             literals: field_lz::u32s_to_le_bytes(&input),
             ..FieldLzSideStreams::default()
         };
-        let plan = plan_field_lz_side_stream_graph(&streams, input.len(), false).unwrap();
+        let plan = build_field_lz_side_stream_graph(&streams, input.len(), false).unwrap();
         assert!(plan
             .transforms
             .iter()
