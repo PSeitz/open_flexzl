@@ -602,17 +602,10 @@ fn plan_literal_side_stream_route(
     bytes: &[u8],
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
-    let raw_route = plan_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)?;
-    if !transpose::should_try_literal_split4(bytes) {
-        return Ok(raw_route);
+    if transpose::should_try_literal_split4(bytes) {
+        return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
     }
-
-    let transposed_route = build_transposed_literal_side_stream_candidate(bytes, next_stream_id)?;
-    if route_wire_size(&transposed_route) + DEFAULT_MIN_STREAM_SIZE < route_wire_size(&raw_route) {
-        Ok(transposed_route)
-    } else {
-        Ok(raw_route)
-    }
+    plan_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
 }
 
 fn plan_raw_side_stream_route(
@@ -695,52 +688,6 @@ fn append_side_stream_route(
 ) {
     stored_streams.extend(route.stored_streams);
     transforms.extend(route.transforms);
-}
-
-fn route_wire_size(route: &SideStreamRoute) -> usize {
-    route
-        .stored_streams
-        .iter()
-        .map(stored_stream_record_wire_size)
-        .sum::<usize>()
-        + route
-            .transforms
-            .iter()
-            .map(transform_record_wire_size)
-            .sum::<usize>()
-}
-
-fn stored_stream_record_wire_size(record: &StoredStreamRecord) -> usize {
-    varint_wire_size(record.stream_id)
-        + varint_wire_size(record.payload.len())
-        + record.payload.len()
-}
-
-fn transform_record_wire_size(record: &TransformRecord) -> usize {
-    varint_wire_size(record.transform_id as usize)
-        + varint_wire_size(record.inputs.len())
-        + record
-            .inputs
-            .iter()
-            .map(|&id| varint_wire_size(id))
-            .sum::<usize>()
-        + varint_wire_size(record.outputs.len())
-        + record
-            .outputs
-            .iter()
-            .map(|&id| varint_wire_size(id))
-            .sum::<usize>()
-        + varint_wire_size(record.private_header.len())
-        + record.private_header.len()
-}
-
-fn varint_wire_size(mut value: usize) -> usize {
-    let mut size = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        size += 1;
-    }
-    size
 }
 
 static DELTA_INT_FIELD_LZ_STRATEGY: DeltaIntFieldLzStrategy = DeltaIntFieldLzStrategy;

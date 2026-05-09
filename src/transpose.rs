@@ -8,6 +8,9 @@ use crate::constants::{MAX_CHUNK_ELEMENTS_U32, U32_WIDTH};
 use crate::Error;
 
 pub(crate) fn should_try_literal_split4(bytes: &[u8]) -> bool {
+    // split4 only applies to reasonably sized streams of complete little-endian
+    // u32 literals; below this, four zstd streams plus a transpose transform is
+    // usually overhead rather than a win.
     if bytes.len() < 256 || !bytes.len().is_multiple_of(U32_WIDTH) {
         return false;
     }
@@ -15,10 +18,12 @@ pub(crate) fn should_try_literal_split4(bytes: &[u8]) -> bool {
     let mut seen = [[false; 256]; U32_WIDTH];
     let mut cardinality = [0usize; U32_WIDTH];
     let mut stable_high_pairs = 0usize;
-    let mut element_count = 0usize;
+    let element_count = bytes.len() / U32_WIDTH;
 
     for element in bytes.chunks_exact(U32_WIDTH) {
-        element_count += 1;
+        // Count values whose high 16 bits are all 0s or all 1s. Those are common
+        // for small signed/unsigned integers and make the high-byte lanes highly
+        // compressible after transposition.
         if (element[2] == 0 && element[3] == 0) || (element[2] == 0xff && element[3] == 0xff) {
             stable_high_pairs += 1;
         }
@@ -26,14 +31,32 @@ pub(crate) fn should_try_literal_split4(bytes: &[u8]) -> bool {
             let seen_byte = &mut seen[lane][byte as usize];
             if !*seen_byte {
                 *seen_byte = true;
+                // Per-lane distinct byte count estimates how compressible each
+                // lane will be when encoded independently.
                 cardinality[lane] += 1;
             }
         }
     }
 
-    stable_high_pairs * 2 >= element_count
-        || (cardinality[2] <= 16 && cardinality[3] <= 16)
-        || cardinality.iter().filter(|&&count| count <= 4).count() >= 2
+    // At least half the values look sign- or zero-extended, so lanes 2 and 3
+    // should compress very well after transposition.
+    if stable_high_pairs * 2 >= element_count {
+        return true;
+    }
+
+    // Both high-byte lanes use only a small byte alphabet, which is another
+    // common shape for small integers and narrow numeric ranges.
+    if cardinality[2] <= 16 && cardinality[3] <= 16 {
+        return true;
+    }
+
+    // Any two lanes are nearly constant, regardless of position, so splitting
+    // is likely to expose long low-entropy streams.
+    if cardinality.iter().filter(|&&count| count <= 4).count() >= 2 {
+        return true;
+    }
+
+    false
 }
 
 pub(crate) fn encode_split4(bytes: &[u8]) -> [Vec<u8>; U32_WIDTH] {
