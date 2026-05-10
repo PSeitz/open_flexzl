@@ -108,9 +108,9 @@ fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Res
     debug_assert!(chunk.len() <= MAX_CHUNK_ELEMENTS_U32);
 
     let analysis = ChunkValueAnalysis::scan_u32(chunk);
-    // TODO: Replace these hand-tuned route thresholds with generic candidate
-    // evaluation (or, longer-term, a Rust-native selector model) as tracked in
-    // `plan.md`. Avoid accumulating dataset-specific branches here.
+    // Keep route choice heuristic-driven and cheap: refine these gates from
+    // benchmark evidence, but avoid dataset-name-shaped branches and avoid
+    // building multiple full chunk candidates just to pick the smallest.
     if analysis.element_count >= LITERAL_ONLY_MIN_ELEMENTS
         && LITERAL_ONLY_MIN_EQUAL_VALUE_RATIO
             .is_at_most(analysis.equal_value_pairs, analysis.element_count)
