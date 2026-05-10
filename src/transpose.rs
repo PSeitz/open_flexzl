@@ -45,8 +45,13 @@ pub(crate) fn should_try_literal_split4(bytes: &[u8]) -> bool {
     }
 
     // Both high-byte lanes use only a small byte alphabet, which is another
-    // common shape for small integers and narrow numeric ranges.
-    if cardinality[2] <= 16 && cardinality[3] <= 16 {
+    // common shape for small integers and narrow numeric ranges. Large streams
+    // with an almost-constant top byte and a modest third-byte alphabet are the
+    // same shape with a wider bounded magnitude; split4 exposes the cheap top
+    // byte and compressible third-byte lane without trying competing routes.
+    if (cardinality[2] <= 16 && cardinality[3] <= 16)
+        || (element_count >= 100_000 && cardinality[2] <= 32 && cardinality[3] <= 4)
+    {
         return true;
     }
 
@@ -103,6 +108,15 @@ pub(crate) fn decode_split4(
 mod tests {
     use super::*;
     use crate::field_lz;
+
+    #[test]
+    fn split4_gate_accepts_large_bounded_wide_tail_shape() {
+        let input: Vec<u32> = (0..100_000u32)
+            .map(|i| ((i % 18) << 16) | ((i.wrapping_mul(65_537)) & 0xffff))
+            .collect();
+        let literal_bytes = field_lz::u32s_to_le_bytes(&input);
+        assert!(should_try_literal_split4(&literal_bytes));
+    }
 
     #[test]
     fn split4_round_trips_literal_bytes() {
