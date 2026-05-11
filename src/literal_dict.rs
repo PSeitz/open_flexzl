@@ -17,10 +17,10 @@ use crate::Error;
 pub(crate) struct LiteralDictCandidate {
     /// Encounter-order dictionary table, stored as little-endian unique `u32`
     /// values. Code indexes refer to entries in this table.
-    pub(crate) table_bytes: Vec<u8>,
+    pub(crate) value_bytes: Vec<u8>,
     /// Per-literal dictionary indexes. Each index selects one table entry and
     /// expands back to one little-endian `u32` literal value during decode.
-    pub(crate) code_bytes: Vec<u8>,
+    pub(crate) dict_ord: Vec<u8>,
     /// Width in bytes of each code entry. The first encoder route emits `1`
     /// (`u8` codes); the decoder also accepts `2` for future `u16` routes.
     pub(crate) code_width: usize,
@@ -79,7 +79,7 @@ pub(crate) fn build_side_stream_route(
         stored_streams: vec![
             StoredStreamRecord {
                 stream_id: dictionary_table_stream_id,
-                payload: candidate.table_bytes,
+                payload: candidate.value_bytes,
             },
             StoredStreamRecord {
                 stream_id: stored_code_stream_id,
@@ -105,47 +105,47 @@ pub(crate) fn build_u8_candidate(bytes: &[u8]) -> Option<LiteralDictCandidate> {
     }
 
     let element_count = bytes.len() / U32_WIDTH;
-    let mut indexes = FxHashMap::<u32, u8>::default();
-    let mut table = Vec::<u32>::new();
-    let mut code_bytes = Vec::with_capacity(element_count);
+    let mut val_to_dict_ord = FxHashMap::<u32, u8>::default();
+    let mut values = Vec::<u32>::new();
+    let mut dict_ord = Vec::with_capacity(element_count);
 
     for chunk in bytes.chunks_exact(U32_WIDTH) {
         let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let index = if let Some(&index) = indexes.get(&value) {
+        let index = if let Some(&index) = val_to_dict_ord.get(&value) {
             index
         } else {
-            if table.len() == 256 {
+            if values.len() == 256 {
                 return None;
             }
-            let index = table.len() as u8;
-            table.push(value);
-            indexes.insert(value, index);
+            let index = values.len() as u8;
+            values.push(value);
+            val_to_dict_ord.insert(value, index);
             index
         };
-        code_bytes.push(index);
+        dict_ord.push(index);
     }
 
     // A dictionary with no repetition is just table + codes overhead. Require a
     // real low-cardinality signal before spending zstd work in the route gate.
-    if table.len() >= element_count {
+    if values.len() >= element_count {
         return None;
     }
 
-    let mut table_bytes = Vec::with_capacity(table.len() * U32_WIDTH);
-    for value in table {
-        table_bytes.extend_from_slice(&value.to_le_bytes());
+    let mut value_bytes = Vec::with_capacity(values.len() * U32_WIDTH);
+    for value in values {
+        value_bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     Some(LiteralDictCandidate {
-        table_bytes,
-        code_bytes,
+        value_bytes,
+        dict_ord,
         code_width: 1,
     })
 }
 
 pub(crate) fn decode(
-    table_bytes: &[u8],
-    code_bytes: &[u8],
+    value_bytes: &[u8],
+    dict_ord: &[u8],
     code_width: usize,
 ) -> Result<Vec<u8>, Error> {
     if code_width != 1 && code_width != 2 {
@@ -153,35 +153,35 @@ pub(crate) fn decode(
             "literal_dict_u32 code width must be 1 or 2",
         ));
     }
-    if !table_bytes.len().is_multiple_of(U32_WIDTH) {
+    if !value_bytes.len().is_multiple_of(U32_WIDTH) {
         return Err(Error::InvalidTransform(
             "literal_dict_u32 dictionary table length must be a multiple of 4",
         ));
     }
-    if code_width == 2 && !code_bytes.len().is_multiple_of(U16_WIDTH) {
+    if code_width == 2 && !dict_ord.len().is_multiple_of(U16_WIDTH) {
         return Err(Error::InvalidTransform(
             "literal_dict_u32 u16 code stream length must be a multiple of 2",
         ));
     }
 
-    let table: Vec<u32> = table_bytes
+    let table: Vec<u32> = value_bytes
         .chunks_exact(U32_WIDTH)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
-    if table.is_empty() && !code_bytes.is_empty() {
+    if table.is_empty() && !dict_ord.is_empty() {
         return Err(Error::InvalidTransform(
             "literal_dict_u32 code references an empty dictionary",
         ));
     }
 
-    let code_count = code_bytes.len() / code_width;
+    let code_count = dict_ord.len() / code_width;
     let mut out = Vec::with_capacity(code_count.checked_mul(U32_WIDTH).ok_or(
         Error::InvalidTransform("literal_dict_u32 output length overflow"),
     )?);
 
     match code_width {
         1 => {
-            for &code in code_bytes {
+            for &code in dict_ord {
                 let value = *table.get(code as usize).ok_or(Error::InvalidTransform(
                     "literal_dict_u32 code is out of dictionary range",
                 ))?;
@@ -189,7 +189,7 @@ pub(crate) fn decode(
             }
         }
         2 => {
-            for chunk in code_bytes.chunks_exact(U16_WIDTH) {
+            for chunk in dict_ord.chunks_exact(U16_WIDTH) {
                 let code = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
                 let value = *table.get(code).ok_or(Error::InvalidTransform(
                     "literal_dict_u32 code is out of dictionary range",
@@ -218,7 +218,7 @@ mod tests {
         let candidate = build_u8_candidate(&bytes).unwrap();
         assert_eq!(candidate.code_width, 1);
         assert_eq!(
-            decode(&candidate.table_bytes, &candidate.code_bytes, 1).unwrap(),
+            decode(&candidate.value_bytes, &candidate.dict_ord, 1).unwrap(),
             bytes
         );
     }
