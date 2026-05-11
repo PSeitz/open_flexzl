@@ -6,7 +6,9 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::constants::{NATIVE_TRANSFORM_ID_LITERAL_DICT_U32, U16_WIDTH, U32_WIDTH};
+use crate::constants::{
+    NATIVE_TRANSFORM_ID_LITERAL_DICT_U32, STANDARD_TRANSFORM_ID_ZSTD, U16_WIDTH, U32_WIDTH,
+};
 use crate::frame::{SideStreamRoute, StoredStreamRecord, TransformRecord};
 use crate::varint;
 use crate::Error;
@@ -37,61 +39,57 @@ pub(crate) struct EncodedSideStreamPayload {
 pub(crate) fn build_side_stream_route(
     choice: LiteralDictRouteChoice,
     mut next_stream_id: usize,
-) -> Result<SideStreamRoute, Error> {
+) -> SideStreamRoute {
     let LiteralDictRouteChoice {
         candidate,
         encoded_codes,
     } = choice;
-    let table_stream_id = next_stream_id;
-    next_stream_id += 1;
-    let mut stored_streams = vec![StoredStreamRecord {
-        // Store the table directly. For low-cardinality literals it is small,
-        // and the route estimate intentionally counts raw table bytes plus a
-        // compressed code stream.
-        stream_id: table_stream_id,
-        payload: candidate.table_bytes,
-    }];
-    let mut transforms = Vec::with_capacity(2);
+    let code_width = candidate.code_width;
 
+    let dictionary_table_stream_id = next_stream_id;
+    next_stream_id += 1;
     let stored_code_stream_id = next_stream_id;
-    let code_stream_id = if encoded_codes.is_zstd {
-        let decoded_code_stream_id = next_stream_id + 1;
-        stored_streams.push(StoredStreamRecord {
-            stream_id: stored_code_stream_id,
-            payload: encoded_codes.payload,
-        });
-        transforms.push(TransformRecord {
-            transform_id: crate::constants::STANDARD_TRANSFORM_ID_ZSTD,
-            inputs: vec![stored_code_stream_id],
-            outputs: vec![decoded_code_stream_id],
-            private_header: varint::encode_u64(candidate.code_width as u64),
-        });
-        next_stream_id += 2;
-        decoded_code_stream_id
-    } else {
-        stored_streams.push(StoredStreamRecord {
-            stream_id: stored_code_stream_id,
-            payload: encoded_codes.payload,
-        });
+    next_stream_id += 1;
+
+    let mut transforms = Vec::with_capacity(2);
+    let decoded_code_stream_id = if encoded_codes.is_zstd {
+        let stream_id = next_stream_id;
         next_stream_id += 1;
+        transforms.push(TransformRecord {
+            transform_id: STANDARD_TRANSFORM_ID_ZSTD,
+            inputs: vec![stored_code_stream_id],
+            outputs: vec![stream_id],
+            private_header: varint::encode_u64(code_width as u64),
+        });
+        stream_id
+    } else {
         stored_code_stream_id
     };
 
-    let output_stream_id = next_stream_id;
+    let decoded_literal_stream_id = next_stream_id;
     next_stream_id += 1;
     transforms.push(TransformRecord {
         transform_id: NATIVE_TRANSFORM_ID_LITERAL_DICT_U32,
-        inputs: vec![table_stream_id, code_stream_id],
-        outputs: vec![output_stream_id],
-        private_header: varint::encode_u64(candidate.code_width as u64),
+        inputs: vec![dictionary_table_stream_id, decoded_code_stream_id],
+        outputs: vec![decoded_literal_stream_id],
+        private_header: varint::encode_u64(code_width as u64),
     });
 
-    Ok(SideStreamRoute {
-        stored_streams,
+    SideStreamRoute {
+        stored_streams: vec![
+            StoredStreamRecord {
+                stream_id: dictionary_table_stream_id,
+                payload: candidate.table_bytes,
+            },
+            StoredStreamRecord {
+                stream_id: stored_code_stream_id,
+                payload: encoded_codes.payload,
+            },
+        ],
         transforms,
-        output_stream_id,
+        output_stream_id: decoded_literal_stream_id,
         next_stream_id,
-    })
+    }
 }
 
 /// Build an encounter-order dictionary using one-byte codes.
