@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use crate::constants::*;
 use crate::delta;
 use crate::field_lz::{self, le_bytes_to_u32s, FieldLzSideStreams};
+use crate::literal_dict::{self, LiteralDictCandidate, LiteralDictRouteChoice};
 use crate::varint::{self, Reader};
 use crate::{transpose, zstd_codec, Error};
 
@@ -108,9 +109,9 @@ fn choose_and_write_best_chunk_encoding(chunk: &[u32], out: &mut Vec<u8>) -> Res
     debug_assert!(chunk.len() <= MAX_CHUNK_ELEMENTS_U32);
 
     let analysis = ChunkValueAnalysis::scan_u32(chunk);
-    // TODO: Replace these hand-tuned route thresholds with generic candidate
-    // evaluation (or, longer-term, a Rust-native selector model) as tracked in
-    // `plan.md`. Avoid accumulating dataset-specific branches here.
+    // Keep route choice heuristic-driven and cheap: refine these gates from
+    // benchmark evidence, but avoid dataset-name-shaped branches and avoid
+    // building multiple full chunk candidates just to pick the smallest.
     if analysis.element_count >= LITERAL_ONLY_MIN_ELEMENTS
         && LITERAL_ONLY_MIN_EQUAL_VALUE_RATIO
             .is_at_most(analysis.equal_value_pairs, analysis.element_count)
@@ -369,6 +370,9 @@ fn read_and_execute_transform_record(
         STANDARD_TRANSFORM_ID_DELTA_INT => {
             execute_delta_int_transform(&inputs, &outputs, &private_header, slots)?
         }
+        NATIVE_TRANSFORM_ID_LITERAL_DICT_U32 => {
+            execute_literal_dict_u32_transform(&inputs, &outputs, &private_header, slots)?
+        }
         other => return Err(Error::UnsupportedTransform(other)),
     };
 
@@ -433,6 +437,54 @@ fn execute_decode_transpose_split4_transform(
     Ok(TransformOutput {
         stream_id: outputs[0],
         bytes: transpose::decode_split4(lanes, chunk_num_elements)?,
+        element_width: Some(U32_WIDTH),
+    })
+}
+
+fn execute_literal_dict_u32_transform(
+    inputs: &[usize],
+    outputs: &[usize],
+    private_header: &[u8],
+    slots: &[StreamSlot],
+) -> Result<TransformOutput, Error> {
+    if inputs.len() != 2 || outputs.len() != 1 {
+        return Err(Error::InvalidTransform(
+            "literal_dict_u32 transform must have two inputs and one output",
+        ));
+    }
+    let code_width = varint::read_single_usize(private_header, "literal_dict_u32 code width")?;
+    if code_width != 1 && code_width != 2 {
+        return Err(Error::InvalidTransform(
+            "literal_dict_u32 code width must be 1 or 2",
+        ));
+    }
+    if slots[inputs[0]]
+        .element_width
+        .is_some_and(|w| w != U32_WIDTH)
+    {
+        return Err(Error::InvalidTransform(
+            "literal_dict_u32 dictionary table element width must be 4",
+        ));
+    }
+    if slots[inputs[1]]
+        .element_width
+        .is_some_and(|w| w != code_width)
+    {
+        return Err(Error::InvalidTransform(
+            "literal_dict_u32 code stream element width does not match code width",
+        ));
+    }
+
+    let table = slots[inputs[0]].bytes.as_deref().ok_or(Error::InvalidMap(
+        "literal_dict_u32 dictionary table stream is undefined",
+    ))?;
+    let codes = slots[inputs[1]].bytes.as_deref().ok_or(Error::InvalidMap(
+        "literal_dict_u32 code stream is undefined",
+    ))?;
+
+    Ok(TransformOutput {
+        stream_id: outputs[0],
+        bytes: literal_dict::decode(table, codes, code_width)?,
         element_width: Some(U32_WIDTH),
     })
 }
@@ -592,10 +644,80 @@ fn encode_literal_side_stream_route(
     bytes: &[u8],
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
+    if let Some(candidate) = literal_dict::build_u8_candidate(bytes) {
+        if let Some(choice) = choose_literal_dict_candidate(bytes, candidate)? {
+            return literal_dict::build_side_stream_route(choice, next_stream_id);
+        }
+    }
+
     if transpose::should_try_literal_split4(bytes) {
         return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
     }
     encode_raw_side_stream_route(bytes, U32_WIDTH, next_stream_id)
+}
+
+fn choose_literal_dict_candidate(
+    bytes: &[u8],
+    candidate: LiteralDictCandidate,
+) -> Result<Option<LiteralDictRouteChoice>, Error> {
+    let encoded_codes = encode_side_stream_payload(&candidate.code_bytes)?;
+    let dict_estimate = candidate
+        .table_bytes
+        .len()
+        .checked_add(encoded_codes.payload.len())
+        .ok_or(Error::InvalidTransform(
+            "literal_dict_u32 estimate overflow",
+        ))?;
+    let baseline_estimate = estimated_current_literal_route_payload_len(bytes)?;
+
+    // Keep the gate conservative: require both a percentage win and a small
+    // absolute win so tiny low-cardinality literal streams do not pay another
+    // transform plus table metadata for little or no frame-level benefit.
+    if dict_estimate * 20 <= baseline_estimate * 19
+        && baseline_estimate.saturating_sub(dict_estimate) >= 64
+    {
+        Ok(Some(LiteralDictRouteChoice {
+            candidate,
+            encoded_codes,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn estimated_current_literal_route_payload_len(bytes: &[u8]) -> Result<usize, Error> {
+    if transpose::should_try_literal_split4(bytes) {
+        let lanes = transpose::encode_split4(bytes);
+        let mut total = 0usize;
+        for lane in lanes {
+            total = total
+                .checked_add(estimated_raw_side_stream_route_payload_len(&lane)?)
+                .ok_or(Error::InvalidTransform("literal split4 estimate overflow"))?;
+        }
+        Ok(total)
+    } else {
+        estimated_raw_side_stream_route_payload_len(bytes)
+    }
+}
+
+fn estimated_raw_side_stream_route_payload_len(bytes: &[u8]) -> Result<usize, Error> {
+    Ok(encode_side_stream_payload(bytes)?.payload.len())
+}
+
+fn encode_side_stream_payload(
+    bytes: &[u8],
+) -> Result<literal_dict::EncodedSideStreamPayload, Error> {
+    if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
+        Ok(literal_dict::EncodedSideStreamPayload {
+            payload: bytes.to_vec(),
+            is_zstd: false,
+        })
+    } else {
+        Ok(literal_dict::EncodedSideStreamPayload {
+            payload: zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?,
+            is_zstd: true,
+        })
+    }
 }
 
 fn encode_raw_side_stream_route(
@@ -854,27 +976,27 @@ struct ChunkGraphPlan {
     stream_slot_count: usize,
 }
 
-struct SideStreamRoute {
-    stored_streams: Vec<StoredStreamRecord>,
-    transforms: Vec<TransformRecord>,
-    output_stream_id: usize,
-    next_stream_id: usize,
+pub(crate) struct SideStreamRoute {
+    pub(crate) stored_streams: Vec<StoredStreamRecord>,
+    pub(crate) transforms: Vec<TransformRecord>,
+    pub(crate) output_stream_id: usize,
+    pub(crate) next_stream_id: usize,
 }
 
 // A payload that appears directly in the serialized chunk encoding. If this
 // stream feeds a zstd transform, the payload is magicless zstd bytes. If it
 // feeds FieldLZ directly, the payload is already the raw side-stream bytes.
-struct StoredStreamRecord {
-    stream_id: usize,
-    payload: Vec<u8>,
+pub(crate) struct StoredStreamRecord {
+    pub(crate) stream_id: usize,
+    pub(crate) payload: Vec<u8>,
 }
 
 // Serialized transform step. Records are written and read in decode order.
-struct TransformRecord {
-    transform_id: u64,
-    inputs: Vec<usize>,
-    outputs: Vec<usize>,
-    private_header: Vec<u8>,
+pub(crate) struct TransformRecord {
+    pub(crate) transform_id: u64,
+    pub(crate) inputs: Vec<usize>,
+    pub(crate) outputs: Vec<usize>,
+    pub(crate) private_header: Vec<u8>,
 }
 
 #[derive(Clone, Default)]
@@ -999,31 +1121,34 @@ mod tests {
             .iter()
             .any(|t| t.transform_id == STANDARD_TRANSFORM_ID_TRANSPOSE_SPLIT4));
 
-        let mut chunk = Vec::new();
-        varint::write_usize(input.len(), &mut chunk);
-        varint::write_usize(plan.stream_slot_count, &mut chunk);
-        varint::write_usize(plan.stored_streams.len(), &mut chunk);
-        varint::write_usize(plan.transforms.len(), &mut chunk);
-        varint::write_usize(plan.final_stream_id, &mut chunk);
-        for stored in plan.stored_streams {
-            varint::write_usize(stored.stream_id, &mut chunk);
-            varint::write_usize(stored.payload.len(), &mut chunk);
-            chunk.extend_from_slice(&stored.payload);
-        }
-        for transform in plan.transforms {
-            varint::write_u64(transform.transform_id, &mut chunk);
-            varint::write_usize(transform.inputs.len(), &mut chunk);
-            for input_id in transform.inputs {
-                varint::write_usize(input_id, &mut chunk);
-            }
-            varint::write_usize(transform.outputs.len(), &mut chunk);
-            for output_id in transform.outputs {
-                varint::write_usize(output_id, &mut chunk);
-            }
-            varint::write_usize(transform.private_header.len(), &mut chunk);
-            chunk.extend_from_slice(&transform.private_header);
-        }
+        let chunk = serialize_field_lz_side_streams(input.len(), &streams, false).unwrap();
+        let decoded = decode_chunk_encoding(&mut Reader::new(&chunk)).unwrap();
+        assert_eq!(decoded, input);
+    }
 
+    #[test]
+    fn literal_dictionary_route_round_trips_when_selected() {
+        let dict: Vec<u32> = (0..79u32)
+            .map(|i| 0x9e37_79b9u32.wrapping_mul(i + 17).rotate_left(i % 29))
+            .collect();
+        let mut state = 0x1234_5678u32;
+        let input: Vec<u32> = (0..34_591usize)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                dict[(state as usize) % dict.len()]
+            })
+            .collect();
+        let streams = FieldLzSideStreams {
+            literals: field_lz::u32s_to_le_bytes(&input),
+            ..FieldLzSideStreams::default()
+        };
+        let plan = build_field_lz_side_stream_graph(&streams, input.len(), false).unwrap();
+        assert!(plan
+            .transforms
+            .iter()
+            .any(|t| t.transform_id == NATIVE_TRANSFORM_ID_LITERAL_DICT_U32));
+
+        let chunk = serialize_field_lz_side_streams(input.len(), &streams, false).unwrap();
         let decoded = decode_chunk_encoding(&mut Reader::new(&chunk)).unwrap();
         assert_eq!(decoded, input);
     }

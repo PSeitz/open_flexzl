@@ -420,6 +420,7 @@ dependencies = [
  "binggan",
  "proptest",
  "rust-openzl",
+ "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "zstd",
 ]

@@ -16,23 +16,28 @@ Important current consensus:
 - `field_lz = 24` is the transform that consumes the five FieldLZ side streams and regenerates the typed chunk. The `u32` meaning comes from `KIND_U32_FIELD_LZ` plus final output metadata.
 - Final output metadata should be stored: type `OPENZL_TYPE_NUMERIC`, element width `4`, total element count.
 - A codec/transform interface is central. Side-stream routing should be represented as transform chains in the chunk map.
-- First implementation can support only zstd and FieldLZ transforms, plus direct raw stored streams if the small-stream route is approved for milestone 1.
+- The implementation now supports zstd (`22`), FieldLZ (`24`), delta_int (`1`), transpose_split4 (`31`), and direct raw stored streams for tiny side streams.
 - This zstd/bootstrap route is not a frame-format limitation; reference side-stream routing is tracked for later parity, but FSE/Huffman/bitpack are not needed for the first version because zstd side streams are good enough initially.
 - Target zstd behavior is modern OpenZL magicless zstd frames with content size present. Rust support was verified with `zstd = { version = "0.13", features = ["experimental"] }`; the implementation uses high-level magicless encode/decode settings plus `ZSTD_getFrameHeader_advanced(..., ZSTD_f_zstd1_magicless)` for content-size validation.
 - Direct small-stream store is included in milestone 1, separately from store-on-expansion. OpenZL’s small-stream threshold is strict `< 10` bytes.
+- Default side-stream zstd level is deliberately `2` for the public no-options encoder. The benchmark's external `zstd_on_raw` column still uses level `6`, so its ratio/speed is a comparison point rather than the OFZL internal setting.
 - Quantize is tracked as a post-v1 reference-parity candidate if raw zstd side streams prove to be a ratio bottleneck: it is reversible `value -> code + raw extra bits`, not dictionary coding.
+- Literal dictionary/categorical coding has landed as native transform `1001` for low-cardinality literal streams. It is separate from quantize: encode a table of unique `u32` values plus compact `u8` codes, then reconstruct the normal little-endian literal stream before FieldLZ consumes it. The decoder accepts `u8` and `u16` code widths; the first encoder route targets the strong `<= 256` unique-value case.
 
 Suggested next-session order:
 
 1. Re-read this plan and the implementation approval checklist.
 2. Phase 3 hardening landed: map-validation negative tests (`tests/map_validation.rs`) and property tests for arbitrary/structured inputs (`tests/properties.rs`). Binary golden fixtures are deliberately deferred — the wire format is still in flux (delta_int just landed, more transforms expected) and pinning byte-exact frames now would be churn for every feature.
-3. Phase 4 `binggan` benchmarks landed (`benches/compression.rs`) with three comparison columns: OFZL, `zstd_on_raw` (raw `u32` LE bytes through zstd at level 6), and `openzl` (via the `rust-openzl 0.1` crate, which calls into the upstream OpenZL C library). Datasets: six synthetic + eight checked-in curated real-world from `test_data` (loaded via `tests/common/datasets.rs`; resolution: `OFZL_TEST_DATA_DIR` env var → `$CARGO_MANIFEST_DIR/test_data`; missing files are skipped). The same loader powers `tests/real_world.rs`, which round-trips every available dataset including the multi-chunk `ten_value_cycle` (~16.5 MiB → 2 chunks).
+3. Phase 4 `binggan` benchmarks landed (`benches/compression.rs`) with three comparison columns: `open_flexzl`, `zstd_on_raw` (raw `u32` LE bytes through zstd at level 6), and `openzl` (via the `rust-openzl 0.1` crate, which calls into the upstream OpenZL C library). Datasets: checked-in curated real-world files from `test_data` plus `all_real_world_concatenated` (loaded via `tests/common/datasets.rs`; resolution: `OFZL_TEST_DATA_DIR` env var → `$CARGO_MANIFEST_DIR/test_data`; missing files are skipped). The same loader powers `tests/real_world.rs`, which round-trips every available dataset including the multi-chunk `ten_value_cycle` (~16.5 MiB → 2 chunks). The benchmark ratio delta display is percentage-point difference, not relative percent change.
 4. **OpenZL ratio gap is dominated by missing transforms, not the parser.** Initial dev-machine results: OpenZL gets 2185× on `monotonic` (delta transform → constant), OFZL gets 1.62× (same as raw zstd). OpenZL gets 2.28× on `all_unique` vs OFZL 1.41×. OpenZL gets 251× on `ten_value_cycle` vs OFZL 120×. On encode speed, OFZL is *often faster* than OpenZL — e.g. 6.6 vs 1.7 GB/s on `single_symbol_floods`, 1.27 vs 0.79 GB/s on `ten_value_cycle`, 643 vs 96 MB/s on `all_unique`. OFZL beats zstd on ratio for two datasets (`ten_value_cycle` 120× vs 106×, `synthetic_traces` 18.4× vs 16.8×); on the rest it's tied or slightly worse than zstd-on-raw.
 5. Stage-2 cleanup landed: hash-table insertion is now sparse (start+1, periodic mid-points, end-1) instead of every position, mirroring OpenZL's fast parser. Net effect on the listed datasets: +52% encode on `repeated_blocks` (6.9 → 10.5 GB/s), +26% on `low_cardinality`, +16% on `single_symbol_floods`, with a ~1% ratio cost on `ten_value_cycle` (135597 → 137027 bytes) where some phase-shift matches go unfound.
 6. Repeated-offset emission was prototyped (rep[0]-take-immediately) and reverted: the trade was poor (5–32% encode regression for 1–15% ratio wins on a few datasets) given the dominant gap is missing transforms.
-7. Stage 3 landed: the OpenZL `delta_int` transform (Standard Transform ID `1`, `value -> first_value + cumulative deltas`) sits *after* FieldLZ in the decode chain — FieldLZ regenerates a delta stream and `delta_int` undoes the delta with a prefix-sum. Encoder tries both the raw path and the delta path and keeps the smaller frame. Decoder validation now accepts the final chunk stream produced either by FieldLZ directly (raw path) or by a `delta_int` whose input is the FieldLZ output (delta path); either way exactly one FieldLZ transform per chunk. Realized impact on the bench: `monotonic` 161549 → **66 bytes** (1.62× → 3970×, *beats* OpenZL's 120 bytes); `all_unique` 961823 → 727951 (1.41× → 1.87×, OpenZL still ahead at 2.28×); other datasets pick the raw path so size is unchanged. Encode cost: ~2× on most data and up to 4× on tiny chunks where fixed overhead dominates; decode cost is unchanged on raw-path frames and slightly higher on delta-path frames due to the prefix-sum pass. Future work: a cheap "skip delta if obviously not worth it" heuristic to recover encode speed on data where delta never wins.
-8. Route-selection caution: avoid dataset-shaped `if` branches in the encoder. The upstream OpenZL numeric graph uses a learned GBT selector (`SI_selector_numeric`) to choose graph labels such as `fieldlz`, `delta_fieldlz`, and `zstd`; `open_flexzl` does not currently track or implement that model. Near-term route selection should prefer generic candidate evaluation (try/estimate candidate encoded sizes, then choose the smallest) over hard-coded thresholds tuned to one benchmark. A Rust-native GBT selector is tracked as a possible long-term parity project only after we have a stable feature set, training corpus, and exported deterministic model representation.
-9. Side-stream route priority clarified: zstd already includes strong entropy coding, so native Huffman/FSE/bitpack should not be assumed to improve ratio enough to justify near-term complexity. Prioritize transforms that expose better structure *before* zstd — especially byte-transposed literal lanes and maybe offset/length quantization — then benchmark. Native entropy codecs remain lower-priority work for reduced per-stream overhead, faster decode, or OpenZL reference parity.
+7. Stage 3 landed: the OpenZL `delta_int` transform (Standard Transform ID `1`, `value -> first_value + cumulative deltas`) sits *after* FieldLZ in the decode chain — FieldLZ regenerates a delta stream and `delta_int` undoes the delta with a prefix-sum. Decoder validation accepts the final chunk stream produced either by FieldLZ directly (raw path) or by a `delta_int` whose input is the FieldLZ output (delta path); either way exactly one FieldLZ transform per chunk. The encoder no longer builds both full raw and delta FieldLZ candidates just to compare them. It chooses one route from cheap analysis: skip delta for strong equal-value runs, force delta for strong constant-stride signals, and otherwise sample one centered 4 Ki-element slice by comparing zstd(raw bytes) vs zstd(delta bytes) before paying for the full delta FieldLZ route.
+8. Byte-transposed literal lanes landed as transform ID `31` (`transpose_split4`). The literal route splits little-endian `u32` bytes into four byte lanes, stores/zstd-codes each lane, then recombines lanes before FieldLZ consumes the logical literal stream. The encoder does not build a competing raw-literal route once the split gate passes; it relies on a heuristic gate: minimum 256 bytes, stable sign/zero-extended high 16 bits, small high-byte cardinalities, two nearly constant lanes, plus the latest large bounded wide-tail case (`element_count >= 100_000`, third-byte cardinality `<= 32`, top-byte cardinality `<= 4`).
+9. Route-selection decision: do **not** add a best-of-N candidate selector. Avoid dataset-shaped branches, but keep route choice as explicit heuristics plus cheap targeted sampling per route. Improve those heuristics when benchmarks expose misses; do not routinely build multiple complete chunk maps just to pick the smallest.
+10. Side-stream route priority clarified: zstd already includes strong entropy coding, so native Huffman/FSE/bitpack should not be assumed to improve ratio enough to justify near-term complexity. Prioritize transforms that expose better structure *before* zstd — especially literal dictionary/categorical coding for hot-head low-cardinality columns, heuristic tuning for byte-transposed literal lanes, and maybe offset/length quantization — then benchmark. Native entropy codecs remain lower-priority work for reduced per-stream overhead, faster decode, or OpenZL reference parity.
+11. Dictionary-case update: native `literal_dict_u32` (`1001`) has landed for low-cardinality literal streams. `hot_head_dictionary` now uses it and improves to ~8.15% output in the benchmark slice (beating both `zstd_on_raw` and OpenZL there). `bursty_mid_dictionary` remains outside the first encoder gate because it has ~2,360 unique values; its remaining gap is more likely literal coding quality plus metadata/offset-length coding.
+12. Rust CI landed under `.github/workflows/rust.yml`: build, `cargo fmt --all -- --check`, clippy with `-D warnings`, and tests on stable Rust for pushes/PRs to `main`.
 
 ## Draft open-question recommendations
 
@@ -118,12 +123,13 @@ This establishes whether parser work or side-stream codecs are the next bottlene
 Add components without changing the outer frame/map:
 
 1. Faster FieldLZ parsers and repeated-offset emission.
-2. Compression/decompression level options and parser route selection policy.
-3. Literal transpose/split routes if benchmarks show literal streams dominate; first evaluate transposed lanes fed to zstd before implementing custom per-lane entropy codecs.
-4. Quantize offsets/lengths (`25`, `26`) if raw zstd side streams leave meaningful ratio on the table; quantization may help by exposing smaller code streams before zstd.
-5. Generic route candidate selection: build or cheaply estimate multiple candidate maps and choose by encoded size / configured objective. Do this before adding benchmark-specific heuristics.
-6. Rust-native GBT selector parity: possible long-term project mirroring upstream OpenZL's learned numeric selector. Requires a fixed feature extractor, training corpus generated by benchmarking all candidate routes, offline model training, deterministic model export, and benchmark validation across the full suite.
-7. Bitpack/constant/Huffman/FSE routes only as long-term speed/overhead/reference-parity work, not as first-version or near-term ratio requirements.
+2. Compression/decompression level options and parser route selection policy. The current no-options default is zstd level `2` by decision.
+3. Literal dictionary/categorical route for low-cardinality literal streams. Implement this before offset/length quantization for the current dictionary gap: table of unique `u32` values plus compact code stream, decoded back to the normal FieldLZ literal bytes.
+4. Literal transpose/split routes have landed; continue tuning their gate from benchmark evidence before implementing custom per-lane entropy codecs.
+5. Quantize offsets/lengths (`25`, `26`) if raw zstd side streams leave meaningful ratio on the table; quantization may help by exposing smaller code streams before zstd.
+6. Heuristic route selection: keep explicit route gates and cheap targeted sampling. Do not add a best-of-N candidate selector, and do not add dataset-name-shaped branches.
+7. Rust-native GBT selector parity: possible long-term project mirroring upstream OpenZL's learned numeric selector. Requires a fixed feature extractor, training corpus generated by benchmarking available routes, offline model training, deterministic model export, and benchmark validation across the full suite. Do not start this until the route set and heuristic baseline are stable.
+8. Bitpack/constant/Huffman/FSE routes only as long-term speed/overhead/reference-parity work, not as first-version or near-term ratio requirements.
 
 ## Component inventory: reuse vs implement ourselves
 
@@ -152,8 +158,9 @@ Add components without changing the outer frame/map:
 - Fast and greedy FieldLZ match finders, using `lz4_flex` and OpenZL as design blueprints rather than linked dependencies.
 - Repeated-offset encoder heuristics.
 - Offset and length quantizers.
-- Literal transpose/split and selector logic.
-- Generic candidate evaluation and selector plumbing.
+- Literal dictionary/categorical transform and route for low-cardinality literal streams.
+- Further literal transpose/split heuristic tuning and any selector logic that remains explicit and cheap.
+- Heuristic route-selection plumbing and targeted sampling for individual routes. Best-of-N candidate evaluation is explicitly not planned.
 - Optional long-term GBT selector parity with OpenZL's numeric graph selector; this should be trained/exported as a Rust-native deterministic model rather than linked to OpenZL's C runtime.
 - Bitpack/FSE/Huffman/constant transform contracts and route choices, with lower priority than structure-exposing transforms because zstd already provides strong entropy coding.
 
@@ -184,8 +191,8 @@ The target is a Rust-native compressor focused on `u32` data, with a design that
 - A codec/transform interface is central to the compressor design; side-stream routing should be planned as transform chains
 - The first implementation milestone may route FieldLZ side streams through zstd, optionally using direct raw store for tiny streams; this bootstrap route is not a frame-format limitation
 - Track OpenZL’s reference side-stream routing, but do not implement FSE/Huffman/bitpack in v1; zstd side streams are good enough initially, so prioritize match-finder speed and structure-exposing transforms before custom entropy codecs
-- Initial literal side-stream route: plain little-endian `u32` literals, likely zstd-compressed; byte-transposed literal lanes are tracked as a likely next ratio experiment because they can expose stable numeric high bytes before zstd
-- Default compression level for the public v1 API: `6`, matching OpenZL’s global default
+- Logical FieldLZ literal input remains plain little-endian `u32` bytes, but the encoder may store that stream through the landed byte-transposed split4 route when its heuristic gate predicts a win.
+- Default compression level for the public v1 API: zstd level `2`, chosen deliberately as the current speed/ratio tradeoff rather than OpenZL’s global default `6`.
 - FieldLZ token semantics should match OpenZL’s token/repeated-offset model
 - Large inputs should be chunked in the native frame; default chunk source size is `16 MiB`
 
@@ -324,11 +331,12 @@ OPENZL_TYPE_STRING:            8
 STANDARD_TRANSFORM_ID_DELTA_INT: 1
 STANDARD_TRANSFORM_ID_ZSTD:    22
 STANDARD_TRANSFORM_ID_FIELD_LZ: 24
+STANDARD_TRANSFORM_ID_TRANSPOSE_SPLIT4: 31
 FIELD_LZ_INPUT_COUNT:          5
 MAX_CHUNK_BYTES:               16 * 1024 * 1024
 MAX_CHUNK_ELEMENTS_U32:        4,194,304
 MAX_OFFSET_ELEMENTS:           4,194,303
-DEFAULT_COMPRESSION_LEVEL:     6
+DEFAULT_COMPRESSION_LEVEL:     2
 DEFAULT_MIN_STREAM_SIZE:       10
 RUNTIME_TRANSFORM_INPUT_LIMIT: 2,048
 RUNTIME_TRANSFORM_LIMIT:       20,000
@@ -353,6 +361,14 @@ STANDARD_TRANSFORM_ID_CONSTANT_FIXED:   45
 STANDARD_TRANSFORM_ID_FSE_V2:           49
 STANDARD_TRANSFORM_ID_HUFFMAN_V2:       50
 ```
+
+Native transform IDs that do not claim OpenZL compatibility:
+
+```text
+NATIVE_TRANSFORM_ID_LITERAL_DICT_U32: 1001
+```
+
+`literal_dict_u32` is deliberately native for now; if an OpenZL-standard dictionary/categorical transform is later identified and its contract matches, the ID/contract can be revisited before binary fixtures are frozen.
 
 `FIELD_LZ_INPUT_COUNT` is fixed because the FieldLZ transform consumes exactly five logical streams: literals, tokens, offsets, extra literal lengths, and extra match lengths. This is not a limit on how many stored streams or transform steps a chunk map may contain.
 
@@ -466,7 +482,7 @@ Zstd rules:
 - `output_elt_width` must be non-zero.
 - The decoded byte length from the zstd frame content size must be a multiple of `output_elt_width`.
 - Decoder verifies that zstd decompression produces exactly the advertised content size.
-- Encoder uses compression level `6` for the public `compress_u32()` default unless a future options API overrides it.
+- Encoder uses compression level `2` for the public `compress_u32()` default unless a future options API overrides it.
 - Empty uncompressed streams are encoded as valid zstd frames for empty input; an empty stored payload is invalid for the zstd transform.
 - Store-on-expansion remains a deliberate initial non-goal unless this plan is revised; OpenZL-style small-stream store routing is separate and should be supported by feeding a raw stored stream directly into the consuming transform.
 
@@ -481,7 +497,44 @@ output stream:      u32 elements (running prefix sum, wrapping)
 ```
 
 Sits after FieldLZ in the decode chain when the delta path is chosen. Encoder
-picks per chunk by trying both paths and keeping the smaller record.
+uses heuristics and cheap sampling to decide whether to build the delta route;
+it does not build full raw and delta FieldLZ candidates just to compare them.
+
+#### Transpose/split4 transform, ID 31
+
+```text
+input_count:        exactly 4
+output_count:       exactly 1
+private_header:     empty
+input streams:      four byte lanes, element width 1, equal lengths
+output stream:      interleaved little-endian u32 literal bytes, element width 4
+```
+
+This transform is currently used only for the FieldLZ literal side stream. It
+recombines four byte-position lanes into the plain literal stream consumed by
+FieldLZ, so FieldLZ's logical input contract remains unchanged.
+
+#### Literal dictionary/categorical transform, native ID 1001
+
+```text
+input_count:        exactly 2
+output_count:       exactly 1
+private_header:     code_width as one canonical LEBU64 (1 or 2)
+input 0:            dictionary table, little-endian unique u32 values
+input 1:            code stream, u8 or little-endian u16 indexes into table
+output stream:      little-endian u32 literal bytes, element width 4
+```
+
+This transform is intended for the FieldLZ literal side stream only. It is
+lossless categorical coding: each literal value is replaced by a compact index
+into a chunk-local dictionary table, and decode expands the codes back to the
+normal plain literal byte stream before FieldLZ runs. Initial encoder gating:
+only consider complete `u32` literal streams with low cardinality (start with
+`<= 256` unique values for `u8` codes; `u16` support is optional/follow-up), and
+require a cheap estimate such as `dictionary_table_bytes + zstd(code_bytes)` to
+beat the current raw/split literal heuristic by a safety margin. This is not
+quantize and should not be used for high-cardinality streams like the current
+`bursty_mid_dictionary` sample.
 
 #### FieldLZ transform, ID 24
 
@@ -501,7 +554,7 @@ The FieldLZ private `chunk_num_elements` must equal the chunk record’s `chunk_
 
 Canonical v1 FieldLZ input stream encodings:
 
-- input 0, literals: little-endian `u32` values, one plain literal stream; no byte transpose in v1
+- input 0, literals: little-endian `u32` values, one plain literal stream after any upstream transpose_split4 route has been decoded
 - input 1, tokens: little-endian `u16` values
 - input 2, offsets: little-endian `u32` values, measured in `u32` elements
 - input 3, extra literal lengths: little-endian `u32` values, measured in `u32` elements
@@ -665,7 +718,9 @@ OpenZL’s `EI_fieldLzDynGraph()` and helper graphs route FieldLZ side streams r
   - reference route: transpose/split fixed-width fields into byte lanes, then run a per-lane selector
   - selector options include store, constant, Huffman/delta-Huffman, zstd/delta-zstd depending on stats and compression/decompression levels
   - bootstrap route: plain literal stream through zstd
-  - near-term experiment: transpose/split byte lanes and feed those lanes to zstd first; this targets numeric data with stable high bytes without immediately reimplementing entropy codecs
+  - implemented route: transpose/split byte lanes and feed those lanes to store-or-zstd first; this targets numeric data with stable high bytes without immediately reimplementing entropy codecs
+  - implemented route: native `literal_dict_u32` for low-cardinality literal streams, targeting hot-head dictionary-like columns
+  - current decision: if the literal dictionary gate passes, use dictionary; otherwise if the literal split heuristic passes, use the transposed route. Keep these as explicit heuristic gates, not a generic best-of-N selector.
 - tokens:
   - reference route: bitpack for small/fast-decode cases, otherwise Huffman
   - v1/bootstrap route: token stream through zstd or direct store for tiny streams
@@ -683,6 +738,10 @@ OpenZL’s `EI_fieldLzDynGraph()` and helper graphs route FieldLZ side streams r
   - in this native map, direct store means the stored stream payload is already the raw bytes consumed by the next transform; no zstd transform is inserted for that stream
   - this is distinct from store-on-expansion, which is still a separate first-milestone non-goal
 
+Literal dictionary/categorical coding is not quantize. Dictionary coding maps repeated full `u32` values to compact table indexes; quantize splits integer magnitudes into a bucket code plus exact remainder bits.
+
+The landed `literal_dict_u32` route is intentionally a FieldLZ literal side-stream codec: parse the original chunk with FieldLZ first, then dictionary-code only the remaining literal values. This avoids paying dictionary codes for values already represented by FieldLZ matches. A dictionary-before-FieldLZ route would be a different future categorical pre-transform (`original values -> codes -> FieldLZ over codes -> inverse dictionary after FieldLZ`) and would need separate width/route-selection work; do not conflate it with the literal side-stream transform.
+
 Quantize is not dictionary coding. It is a reversible integer split:
 
 ```text
@@ -691,16 +750,17 @@ value -> (small code, raw extra bits)
 
 For offsets, the code is essentially `floor(log2(value))`, and the extra bits store the low bits needed to reconstruct the exact offset. For lengths, values below 16 have direct codes, then the scheme switches to power-of-two buckets. The code stream is narrow (`u8`) and usually compresses well. First evaluate these structure-exposing splits with zstd-compressed code/extra streams; FSE/bitpack/Huffman are reference-parity or speed/overhead follow-ups, not prerequisites for trying quantize.
 
-Compression level and decompression level should eventually influence parser and side-stream route choices like OpenZL. The public no-options API uses compression level `6` and OpenZL default decompression level behavior unless/until options are added.
+Compression level and decompression level should eventually influence parser and side-stream route choices like OpenZL. The public no-options API currently uses zstd compression level `2` and OpenZL default decompression level behavior unless/until options are added.
 
 ### Implementation milestones for codecs/transforms
 
-1. Required bootstrap transforms: zstd (`22`) and FieldLZ (`24`).
-2. Add direct stored-stream routing for streams below `DEFAULT_MIN_STREAM_SIZE` (`< 10` bytes), matching OpenZL’s small-stream route.
-3. Prioritize benchmark-driven route choices before adding more side-stream codecs.
-4. Add literal transpose/split as the first likely side-stream ratio experiment, initially still feeding lanes to zstd.
-5. Add quantize offsets/lengths (`25`, `26`) later only if benchmarks show raw zstd offset/length streams are a ratio bottleneck; first try zstd over quantized code/extra streams.
-6. Add bitpack/FSE/Huffman/constant only as longer-term speed/overhead/reference-parity work, not v1 work and not a near-term ratio assumption.
+1. Required bootstrap transforms zstd (`22`) and FieldLZ (`24`) are implemented.
+2. Direct stored-stream routing for streams below `DEFAULT_MIN_STREAM_SIZE` (`< 10` bytes), matching OpenZL’s small-stream route, is implemented.
+3. `delta_int` (`1`) and literal `transpose_split4` (`31`) are implemented.
+4. Native literal dictionary/categorical coding (`1001`) for low-cardinality literal streams has landed; first encoder route targets `<= 256` unique `u32` literals with `u8` codes.
+5. Prioritize benchmark-driven heuristic tuning before adding more side-stream codecs.
+6. Add quantize offsets/lengths (`25`, `26`) later only if benchmarks show raw zstd offset/length streams are a ratio bottleneck; first try zstd over quantized code/extra streams.
+7. Add bitpack/FSE/Huffman/constant only as longer-term speed/overhead/reference-parity work, not v1 work and not a near-term ratio assumption.
 
 Adding a transform should add support for another `transform_id` and planner route; it should not require changing the FieldLZ token model or outer chunk map.
 
@@ -766,12 +826,9 @@ Benchmarks use `binggan` and should measure:
 
 Datasets:
 
-- repeated blocks
-- monotonic ranges
-- low-cardinality values
-- sparse/high-byte-stable values
-- random data
-- synthetic traces with repeated records
+- checked-in real-world representative files under `test_data`
+- `all_real_world_concatenated`
+- synthetic datasets remain in the bench source as disabled helpers for ad-hoc runs
 
 Comparisons:
 
@@ -798,23 +855,24 @@ The side-stream codecs above are not non-goals for the whole project, but they a
 2. The map uses OpenZL-like standard transform IDs, not fixed per-stream codec IDs.
 3. The first implementation encoder may compress the five FieldLZ input streams independently with zstd transforms, but this is only the bootstrap route.
 4. Reference side-stream routing is tracked and should be implemented incrementally through the transform interface.
-5. Initial literals use a single plain little-endian `u32` stream. Byte-transposed literal lanes are deferred to the reference literal route milestone.
-6. The public `compress_u32()` default compression level is `6`.
+5. The logical FieldLZ literal stream is still plain little-endian `u32` bytes, but byte-transposed literal side-stream routing has landed as transform ID `31`; native literal dictionary routing (`1001`) is the next planned literal route for low-cardinality streams.
+6. The public `compress_u32()` default zstd compression level is `2`.
 7. The token model follows exact OpenZL FieldLZ semantics, including repeated offsets and extra lengths.
 8. Large inputs are chunked instead of rejected solely because they exceed the FieldLZ offset window.
 
 ## Deferred / tracked optimizations
 
-- Byte-transposed literal lanes: split the literal `u32` stream into four byte-position lanes and compress each lane separately, initially with zstd. This is not zigzag and does not change values. It may improve ratio for numeric data with stable high bytes.
+- Literal dictionary/categorical route: implement native ID `1001` for low-cardinality `u32` literal streams. Start with `<= 256` unique values and `u8` codes, dictionary table as little-endian `u32`s, code stream through store-or-zstd, and a heuristic estimate/safety margin. This is the leading next step for `hot_head_dictionary`.
+- Byte-transposed literal lane heuristic tuning: split4 is implemented; continue improving its gate for numeric data with stable high bytes or bounded byte-lane cardinality.
 - Quantized offset/length code+extra streams, initially with zstd over the split streams if benchmarks show these side streams dominate.
-- Generic route candidate selection: prefer reusable candidate evaluation over dataset-specific `if` branches. Candidate choice should be based on encoded size, estimated size, or an explicit objective that can be benchmarked across all datasets.
-- Rust-native GBT selector parity: long-term only. Steps: define candidate labels, implement stable feature extraction, generate training data by running all candidate routes over representative chunks, train offline, export the model into deterministic Rust data/code, and validate against the benchmark suite. Do not add model-shaped code until the route set is stable.
+- Heuristic route selection: keep improving cheap analysis and targeted sampling. Best-of-N candidate selection is explicitly rejected for now.
+- Rust-native GBT selector parity: long-term only. Steps: define candidate labels, implement stable feature extraction, generate training data from representative chunks, train offline, export the model into deterministic Rust data/code, and validate against the benchmark suite. Do not add model-shaped code until the route set and heuristic baseline are stable.
 - Non-zstd side-stream codecs and selectors, tracked in the reference side-stream routing section, lower priority than structure-exposing transforms because zstd already provides strong entropy coding.
 - Compression-level options, decompression-level options, and parser strategy options.
 
 ## v1 spec test vectors
 
-These are semantic/pre-zstd vectors. Full binary frame fixtures should be checked in during implementation using the v1 constants, canonical varints, zstd level 6, and the exact zstd crate version in `Cargo.lock`.
+These are semantic/pre-zstd vectors. Full binary frame fixtures should be checked in later using the v1 constants, canonical varints, zstd level 2, and the exact zstd crate version in `Cargo.lock` once the codec set is stable.
 
 ### Empty frame
 
@@ -901,7 +959,7 @@ Approved checklist:
 - [x] Canonical unsigned LEBU64 is accepted as the varint format.
 - [x] Chunks use the simple native decoding-map structure with OpenZL-like transform IDs and OpenZL-derived runtime limits, rather than exact OpenZL frame-map encoding.
 - [x] Top-level frame stores final output metadata: OpenZL type, element width, and element count.
-- [x] The first implementation must support transform IDs 22 (`zstd`) and 24 (`field_lz`); later transform IDs can be added without changing the outer map.
+- [x] The implementation supports transform IDs 1 (`delta_int`), 22 (`zstd`), 24 (`field_lz`), and 31 (`transpose_split4`); later transform IDs can be added without changing the outer map.
 - [x] Zstd transform behavior is finalized after checking Rust zstd magicless support; target is modern OpenZL magicless payloads with content size present and output element width in the private header. High-level magicless settings are available with the `experimental` feature; content-size validation uses `ZSTD_getFrameHeader_advanced`.
 - [x] Direct small-stream store (`byte_size < 10`) is milestone 1.
 - [x] Empty input uses `chunk_count = 0`; non-empty chunks must have at least one element.
@@ -910,9 +968,9 @@ Approved checklist:
 - [x] Benchmarks use `binggan`, not Criterion.
 - [x] FSE/Huffman/bitpack side-stream codecs are deferred beyond v1; zstd side streams are sufficient initially.
 - [x] Reference side-stream routing is tracked but implemented incrementally through the transform interface.
-- [x] Byte-transposed literals remain deferred to the reference literal route milestone.
+- [x] Byte-transposed literal routing has landed as transform ID 31; current work is heuristic tuning, not a best-of-N selector.
 - [ ] Full binary golden fixtures are deferred. Pinning byte-exact frames now would create churn on every codec/parser change while the format is still evolving. Revisit once the codec set is stable.
 
 ## Next step
 
-Continue with hardening: expand corrupt-frame/map tests, add property tests, then add `binggan` benchmarks before parser or side-stream-codec optimization. Binary golden fixtures are deferred until the codec set is stable.
+Implement the native literal dictionary/categorical route for low-cardinality literal streams, then wire it into the explicit route heuristics for `hot_head_dictionary`-like data without adding a best-of-N candidate selector. Keep binary golden fixtures deferred until the codec set is stable.

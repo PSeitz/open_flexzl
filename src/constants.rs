@@ -12,6 +12,7 @@ pub(crate) const STANDARD_TRANSFORM_ID_DELTA_INT: u64 = 1;
 pub(crate) const STANDARD_TRANSFORM_ID_ZSTD: u64 = 22;
 pub(crate) const STANDARD_TRANSFORM_ID_FIELD_LZ: u64 = 24;
 pub(crate) const STANDARD_TRANSFORM_ID_TRANSPOSE_SPLIT4: u64 = 31;
+pub(crate) const NATIVE_TRANSFORM_ID_LITERAL_DICT_U32: u64 = 1001;
 
 pub(crate) const FIELD_LZ_INPUT_COUNT: usize = 5;
 pub(crate) const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
