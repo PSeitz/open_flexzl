@@ -663,9 +663,9 @@ fn choose_literal_dict_candidate(
     bytes: &[u8],
     candidate: LiteralDictCandidate,
 ) -> Result<Option<LiteralDictRouteChoice>, Error> {
-    let encoded_codes = encode_side_stream_payload(&candidate.code_bytes)?;
+    let encoded_codes = encode_side_stream_payload(&candidate.dict_ord)?;
     let dict_estimate = candidate
-        .table_bytes
+        .value_bytes
         .len()
         .checked_add(encoded_codes.payload.len())
         .ok_or(Error::InvalidTransform(
