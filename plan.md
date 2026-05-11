@@ -959,7 +959,7 @@ Approved checklist:
 - [x] Canonical unsigned LEBU64 is accepted as the varint format.
 - [x] Chunks use the simple native decoding-map structure with OpenZL-like transform IDs and OpenZL-derived runtime limits, rather than exact OpenZL frame-map encoding.
 - [x] Top-level frame stores final output metadata: OpenZL type, element width, and element count.
-- [x] The implementation supports transform IDs 1 (`delta_int`), 22 (`zstd`), 24 (`field_lz`), and 31 (`transpose_split4`); later transform IDs can be added without changing the outer map.
+- [x] The implementation supports transform IDs 1 (`delta_int`), 22 (`zstd`), 24 (`field_lz`), 31 (`transpose_split4`), and 1001 (`literal_dict_u32`); later transform IDs can be added without changing the outer map.
 - [x] Zstd transform behavior is finalized after checking Rust zstd magicless support; target is modern OpenZL magicless payloads with content size present and output element width in the private header. High-level magicless settings are available with the `experimental` feature; content-size validation uses `ZSTD_getFrameHeader_advanced`.
 - [x] Direct small-stream store (`byte_size < 10`) is milestone 1.
 - [x] Empty input uses `chunk_count = 0`; non-empty chunks must have at least one element.
@@ -969,8 +969,9 @@ Approved checklist:
 - [x] FSE/Huffman/bitpack side-stream codecs are deferred beyond v1; zstd side streams are sufficient initially.
 - [x] Reference side-stream routing is tracked but implemented incrementally through the transform interface.
 - [x] Byte-transposed literal routing has landed as transform ID 31; current work is heuristic tuning, not a best-of-N selector.
+- [x] Literal dictionary/categorical routing has landed as native transform ID 1001 for low-cardinality FieldLZ literal streams.
 - [ ] Full binary golden fixtures are deferred. Pinning byte-exact frames now would create churn on every codec/parser change while the format is still evolving. Revisit once the codec set is stable.
 
 ## Next step
 
-Implement the native literal dictionary/categorical route for low-cardinality literal streams, then wire it into the explicit route heuristics for `hot_head_dictionary`-like data without adding a best-of-N candidate selector. Keep binary golden fixtures deferred until the codec set is stable.
+Next investigate benchmark-driven route improvements: tune the landed literal dictionary/transpose gates, consider whether a future `u16` literal-dictionary route helps medium-cardinality streams, and evaluate a separate chunk-global categorical pre-transform (`original values -> codes -> FieldLZ over codes -> inverse dictionary`) only if whole-chunk analysis shows it beats the current FieldLZ-literal-side-stream dictionary route. Keep binary golden fixtures deferred until the codec set is stable.
