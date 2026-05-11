@@ -5,6 +5,7 @@ edition = "2021"
 description = "Rust-native fixed-width numeric compression inspired by OpenZL, initially focused on u32."
 
 [dependencies]
+rustc-hash = "2"
 thiserror = "2"
 zstd = { version = "0.13", features = ["experimental"] }
 

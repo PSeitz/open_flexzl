@@ -22,7 +22,7 @@ Important current consensus:
 - Direct small-stream store is included in milestone 1, separately from store-on-expansion. OpenZL’s small-stream threshold is strict `< 10` bytes.
 - Default side-stream zstd level is deliberately `2` for the public no-options encoder. The benchmark's external `zstd_on_raw` column still uses level `6`, so its ratio/speed is a comparison point rather than the OFZL internal setting.
 - Quantize is tracked as a post-v1 reference-parity candidate if raw zstd side streams prove to be a ratio bottleneck: it is reversible `value -> code + raw extra bits`, not dictionary coding.
-- Literal dictionary/categorical coding is now the leading next transform for `hot_head_dictionary`-like low-cardinality literal streams. It is separate from quantize: encode a table of unique `u32` values plus compact `u8`/`u16` codes, then reconstruct the normal little-endian literal stream before FieldLZ consumes it.
+- Literal dictionary/categorical coding has landed as native transform `1001` for low-cardinality literal streams. It is separate from quantize: encode a table of unique `u32` values plus compact `u8` codes, then reconstruct the normal little-endian literal stream before FieldLZ consumes it. The decoder accepts `u8` and `u16` code widths; the first encoder route targets the strong `<= 256` unique-value case.
 
 Suggested next-session order:
 
@@ -36,7 +36,7 @@ Suggested next-session order:
 8. Byte-transposed literal lanes landed as transform ID `31` (`transpose_split4`). The literal route splits little-endian `u32` bytes into four byte lanes, stores/zstd-codes each lane, then recombines lanes before FieldLZ consumes the logical literal stream. The encoder does not build a competing raw-literal route once the split gate passes; it relies on a heuristic gate: minimum 256 bytes, stable sign/zero-extended high 16 bits, small high-byte cardinalities, two nearly constant lanes, plus the latest large bounded wide-tail case (`element_count >= 100_000`, third-byte cardinality `<= 32`, top-byte cardinality `<= 4`).
 9. Route-selection decision: do **not** add a best-of-N candidate selector. Avoid dataset-shaped branches, but keep route choice as explicit heuristics plus cheap targeted sampling per route. Improve those heuristics when benchmarks expose misses; do not routinely build multiple complete chunk maps just to pick the smallest.
 10. Side-stream route priority clarified: zstd already includes strong entropy coding, so native Huffman/FSE/bitpack should not be assumed to improve ratio enough to justify near-term complexity. Prioritize transforms that expose better structure *before* zstd — especially literal dictionary/categorical coding for hot-head low-cardinality columns, heuristic tuning for byte-transposed literal lanes, and maybe offset/length quantization — then benchmark. Native entropy codecs remain lower-priority work for reduced per-stream overhead, faster decode, or OpenZL reference parity.
-11. Current dictionary-case diagnosis: forcing/disabling split4 showed split is not the issue. `hot_head_dictionary` currently does not split; forcing split worsens output badly (~23.24% vs 12.61%). `bursty_mid_dictionary` currently does split; disabling split is slightly worse in ratio (~16.52% vs 16.49%) and much slower. `hot_head_dictionary` is mostly literals with only 79 unique values over 34,591 elements; a rough local estimate for dictionary-coded literals is ~11.2 KiB at zstd level 2 vs ~17.4 KiB for current raw literal zstd, so a literal dictionary route may beat both `zstd_on_raw` and OpenZL on that dataset. `bursty_mid_dictionary` has ~2,360 unique values, so a dictionary table is much less attractive there; its remaining gap is more likely literal coding quality plus metadata/offset-length coding.
+11. Dictionary-case update: native `literal_dict_u32` (`1001`) has landed for low-cardinality literal streams. `hot_head_dictionary` now uses it and improves to ~8.15% output in the benchmark slice (beating both `zstd_on_raw` and OpenZL there). `bursty_mid_dictionary` remains outside the first encoder gate because it has ~2,360 unique values; its remaining gap is more likely literal coding quality plus metadata/offset-length coding.
 12. Rust CI landed under `.github/workflows/rust.yml`: build, `cargo fmt --all -- --check`, clippy with `-D warnings`, and tests on stable Rust for pushes/PRs to `main`.
 
 ## Draft open-question recommendations
@@ -719,8 +719,8 @@ OpenZL’s `EI_fieldLzDynGraph()` and helper graphs route FieldLZ side streams r
   - selector options include store, constant, Huffman/delta-Huffman, zstd/delta-zstd depending on stats and compression/decompression levels
   - bootstrap route: plain literal stream through zstd
   - implemented route: transpose/split byte lanes and feed those lanes to store-or-zstd first; this targets numeric data with stable high bytes without immediately reimplementing entropy codecs
-  - planned near-term route: native `literal_dict_u32` for low-cardinality literal streams, targeting hot-head dictionary-like columns
-  - current decision: if the literal split heuristic passes, use the transposed route rather than building both literal routes and comparing them. Add dictionary as another explicit heuristic gate, not a generic best-of-N selector.
+  - implemented route: native `literal_dict_u32` for low-cardinality literal streams, targeting hot-head dictionary-like columns
+  - current decision: if the literal dictionary gate passes, use dictionary; otherwise if the literal split heuristic passes, use the transposed route. Keep these as explicit heuristic gates, not a generic best-of-N selector.
 - tokens:
   - reference route: bitpack for small/fast-decode cases, otherwise Huffman
   - v1/bootstrap route: token stream through zstd or direct store for tiny streams
@@ -740,6 +740,8 @@ OpenZL’s `EI_fieldLzDynGraph()` and helper graphs route FieldLZ side streams r
 
 Literal dictionary/categorical coding is not quantize. Dictionary coding maps repeated full `u32` values to compact table indexes; quantize splits integer magnitudes into a bucket code plus exact remainder bits.
 
+The landed `literal_dict_u32` route is intentionally a FieldLZ literal side-stream codec: parse the original chunk with FieldLZ first, then dictionary-code only the remaining literal values. This avoids paying dictionary codes for values already represented by FieldLZ matches. A dictionary-before-FieldLZ route would be a different future categorical pre-transform (`original values -> codes -> FieldLZ over codes -> inverse dictionary after FieldLZ`) and would need separate width/route-selection work; do not conflate it with the literal side-stream transform.
+
 Quantize is not dictionary coding. It is a reversible integer split:
 
 ```text
@@ -755,7 +757,7 @@ Compression level and decompression level should eventually influence parser and
 1. Required bootstrap transforms zstd (`22`) and FieldLZ (`24`) are implemented.
 2. Direct stored-stream routing for streams below `DEFAULT_MIN_STREAM_SIZE` (`< 10` bytes), matching OpenZL’s small-stream route, is implemented.
 3. `delta_int` (`1`) and literal `transpose_split4` (`31`) are implemented.
-4. Add native literal dictionary/categorical coding (`1001`) for low-cardinality literal streams before offset/length quantization; first target `hot_head_dictionary`.
+4. Native literal dictionary/categorical coding (`1001`) for low-cardinality literal streams has landed; first encoder route targets `<= 256` unique `u32` literals with `u8` codes.
 5. Prioritize benchmark-driven heuristic tuning before adding more side-stream codecs.
 6. Add quantize offsets/lengths (`25`, `26`) later only if benchmarks show raw zstd offset/length streams are a ratio bottleneck; first try zstd over quantized code/extra streams.
 7. Add bitpack/FSE/Huffman/constant only as longer-term speed/overhead/reference-parity work, not v1 work and not a near-term ratio assumption.

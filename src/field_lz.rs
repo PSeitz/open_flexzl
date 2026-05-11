@@ -257,32 +257,32 @@ pub(crate) fn decode_side_streams(
     }
 
     output.extend_from_slice(&literals[literal_pos..]);
-    literal_pos = literals.len();
-
-    if literal_pos != literals.len() {
-        return Err(Error::InvalidFieldLz(
-            "literal stream was not fully consumed",
-        ));
-    }
-    if offset_pos != offsets.len() {
-        return Err(Error::InvalidFieldLz(
+    let checks = [
+        (
+            offset_pos,
+            offsets.len(),
             "offset stream was not fully consumed",
-        ));
-    }
-    if extra_ll_pos != extra_ll.len() {
-        return Err(Error::InvalidFieldLz(
-            "extra literal length stream was not fully consumed",
-        ));
-    }
-    if extra_ml_pos != extra_ml.len() {
-        return Err(Error::InvalidFieldLz(
-            "extra match length stream was not fully consumed",
-        ));
-    }
-    if output.len() != chunk_num_elements {
-        return Err(Error::InvalidFieldLz(
+        ),
+        (
+            extra_ll_pos,
+            extra_ll.len(),
+            "extra literal length was not fully consumed",
+        ),
+        (
+            extra_ml_pos,
+            extra_ml.len(),
+            "extra match length was not fully consumed",
+        ),
+        (
+            output.len(),
+            chunk_num_elements,
             "decoded output length does not match chunk length",
-        ));
+        ),
+    ];
+    for (expected, len, error_msg) in checks {
+        if expected != len {
+            return Err(Error::InvalidFieldLz(error_msg));
+        }
     }
 
     Ok(u32s_to_le_bytes(&output))
