@@ -646,7 +646,10 @@ fn encode_literal_side_stream_route(
 ) -> Result<SideStreamRoute, Error> {
     if let Some(candidate) = literal_dict::build_u8_candidate(bytes) {
         if let Some(choice) = choose_literal_dict_candidate(bytes, candidate)? {
-            return literal_dict::build_side_stream_route(choice, next_stream_id);
+            return Ok(literal_dict::build_side_stream_route(
+                choice,
+                next_stream_id,
+            ));
         }
     }
 
