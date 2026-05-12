@@ -90,11 +90,7 @@ pub(crate) fn decode_side_streams(
     inputs: [&[u8]; 5],
     chunk_num_elements: usize,
 ) -> Result<Vec<u8>, Error> {
-    let literal_bytes = inputs[0];
-    let token_bytes = inputs[1];
-    let offset_bytes = inputs[2];
-    let extra_ll_bytes = inputs[3];
-    let extra_ml_bytes = inputs[4];
+    let [literal_bytes, token_bytes, offset_bytes, extra_ll_bytes, extra_ml_bytes] = inputs;
 
     let max_literal_bytes = chunk_num_elements
         .checked_mul(U32_WIDTH)
@@ -256,7 +252,13 @@ pub(crate) fn decode_side_streams(
         }
     }
 
-    output.extend_from_slice(&literals[literal_pos..]);
+    let trailing_literals = &literals[literal_pos..];
+    if output.len() + trailing_literals.len() > chunk_num_elements {
+        return Err(Error::InvalidFieldLz(
+            "decoded output length does not match chunk length",
+        ));
+    }
+    output.extend_from_slice(trailing_literals);
     let checks = [
         (
             offset_pos,
@@ -400,9 +402,7 @@ fn read_le_u32_stream(bytes: &[u8]) -> Vec<u32> {
 
 pub(crate) fn u32s_to_le_bytes(values: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * U32_WIDTH);
-    for &value in values {
-        push_u32(value, &mut bytes);
-    }
+    append_literal_values(values, &mut bytes);
     bytes
 }
 
@@ -506,5 +506,14 @@ mod tests {
         let token = 0x0400u16.to_le_bytes();
         let inputs = [&literals[..], &token[..], &[][..], &[][..], &[][..]];
         assert!(decode_side_streams(inputs, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_literals_that_exceed_chunk_length() {
+        let literals = u32s_to_le_bytes(&[7, 8]);
+        let token = 0x0004u16.to_le_bytes(); // one literal, one repeat-offset match
+        let inputs = [&literals[..], &token[..], &[][..], &[][..], &[][..]];
+        let err = decode_side_streams(inputs, 2).unwrap_err().to_string();
+        assert!(err.contains("decoded output length"));
     }
 }

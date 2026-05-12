@@ -179,25 +179,16 @@ pub(crate) fn decode(
         Error::InvalidTransform("literal_dict_u32 output length overflow"),
     )?);
 
-    match code_width {
-        1 => {
-            for &code in dict_ord {
-                let value = *table.get(code as usize).ok_or(Error::InvalidTransform(
-                    "literal_dict_u32 code is out of dictionary range",
-                ))?;
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        2 => {
-            for chunk in dict_ord.chunks_exact(U16_WIDTH) {
-                let code = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
-                let value = *table.get(code).ok_or(Error::InvalidTransform(
-                    "literal_dict_u32 code is out of dictionary range",
-                ))?;
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        _ => unreachable!(),
+    for chunk in dict_ord.chunks_exact(code_width) {
+        let code = match code_width {
+            1 => chunk[0] as usize,
+            2 => u16::from_le_bytes([chunk[0], chunk[1]]) as usize,
+            _ => unreachable!(),
+        };
+        let value = *table.get(code).ok_or(Error::InvalidTransform(
+            "literal_dict_u32 code is out of dictionary range",
+        ))?;
+        out.extend_from_slice(&value.to_le_bytes());
     }
 
     Ok(out)

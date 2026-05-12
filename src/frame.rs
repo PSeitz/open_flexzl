@@ -51,7 +51,7 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
 
 pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
     let mut reader = Reader::new(input);
-    if reader.read_exact(MAGIC.len())? != MAGIC {
+    if reader.read_exact(MAGIC.len(), "magic")? != MAGIC {
         return Err(Error::InvalidFrame("bad magic"));
     }
     if reader.read_u8("version")? != VERSION_V1 {
@@ -230,7 +230,9 @@ fn decode_chunk_encoding(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
             return Err(Error::InvalidMap("stream slot defined more than once"));
         }
         let byte_len = reader.read_usize("stored stream byte length")?;
-        let payload = reader.read_exact(byte_len)?.to_vec();
+        let payload = reader
+            .read_exact(byte_len, "stored stream payload")?
+            .to_vec();
         slots[stream_id].bytes = Some(payload);
     }
 
@@ -315,7 +317,12 @@ fn read_and_execute_transform_record(
     let mut inputs = Vec::with_capacity(input_count);
     for _ in 0..input_count {
         let stream_id = reader.read_usize("input stream id")?;
-        validate_transform_input_stream_id(stream_id, slots)?;
+        if stream_id >= slots.len() {
+            return Err(Error::InvalidMap("transform input id is out of range"));
+        }
+        if slots[stream_id].bytes.is_none() {
+            return Err(Error::InvalidMap("transform input stream is undefined"));
+        }
         inputs.push(stream_id);
     }
 
@@ -339,7 +346,9 @@ fn read_and_execute_transform_record(
     }
 
     let private_header_len = reader.read_usize("private_header_len")?;
-    let private_header = reader.read_exact(private_header_len)?.to_vec();
+    let private_header = reader
+        .read_exact(private_header_len, "transform private header")?
+        .to_vec();
 
     for &input in &inputs {
         slots[input].used = true;
@@ -563,16 +572,6 @@ fn execute_field_lz_transform(
     })
 }
 
-fn validate_transform_input_stream_id(stream_id: usize, slots: &[StreamSlot]) -> Result<(), Error> {
-    if stream_id >= slots.len() {
-        return Err(Error::InvalidMap("transform input id is out of range"));
-    }
-    if slots[stream_id].bytes.is_none() {
-        return Err(Error::InvalidMap("transform input stream is undefined"));
-    }
-    Ok(())
-}
-
 fn build_field_lz_side_stream_graph(
     streams: &FieldLzSideStreams,
     chunk_num_elements: usize,
@@ -710,17 +709,14 @@ fn estimated_raw_side_stream_route_payload_len(bytes: &[u8]) -> Result<usize, Er
 fn encode_side_stream_payload(
     bytes: &[u8],
 ) -> Result<literal_dict::EncodedSideStreamPayload, Error> {
-    if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
-        Ok(literal_dict::EncodedSideStreamPayload {
-            payload: bytes.to_vec(),
-            is_zstd: false,
-        })
+    let is_zstd = bytes.len() >= DEFAULT_MIN_STREAM_SIZE;
+    let payload = if is_zstd {
+        zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?
     } else {
-        Ok(literal_dict::EncodedSideStreamPayload {
-            payload: zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?,
-            is_zstd: true,
-        })
-    }
+        bytes.to_vec()
+    };
+
+    Ok(literal_dict::EncodedSideStreamPayload { payload, is_zstd })
 }
 
 fn encode_raw_side_stream_route(
@@ -728,36 +724,31 @@ fn encode_raw_side_stream_route(
     element_width: usize,
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
-    if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
-        let stream_id = next_stream_id;
-        return Ok(SideStreamRoute {
-            stored_streams: vec![StoredStreamRecord {
-                stream_id,
-                payload: bytes.to_vec(),
-            }],
-            transforms: Vec::new(),
-            output_stream_id: stream_id,
-            next_stream_id: next_stream_id + 1,
-        });
-    }
-
+    let encoded = encode_side_stream_payload(bytes)?;
     let stored_id = next_stream_id;
-    let decoded_id = next_stream_id + 1;
-    let payload = zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?;
-    Ok(SideStreamRoute {
+    let mut route = SideStreamRoute {
         stored_streams: vec![StoredStreamRecord {
             stream_id: stored_id,
-            payload,
+            payload: encoded.payload,
         }],
-        transforms: vec![TransformRecord {
+        transforms: Vec::new(),
+        output_stream_id: stored_id,
+        next_stream_id: next_stream_id + 1,
+    };
+
+    if encoded.is_zstd {
+        let decoded_id = route.next_stream_id;
+        route.transforms.push(TransformRecord {
             transform_id: STANDARD_TRANSFORM_ID_ZSTD,
             inputs: vec![stored_id],
             outputs: vec![decoded_id],
             private_header: varint::encode_u64(element_width as u64),
-        }],
-        output_stream_id: decoded_id,
-        next_stream_id: next_stream_id + 2,
-    })
+        });
+        route.output_stream_id = decoded_id;
+        route.next_stream_id += 1;
+    }
+
+    Ok(route)
 }
 
 fn build_transposed_literal_side_stream_candidate(

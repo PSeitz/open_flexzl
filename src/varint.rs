@@ -5,9 +5,13 @@
 
 use crate::Error;
 
+const U64_VARINT_MAX_BYTES: usize = 10;
+const VARINT_CONTINUATION_BIT: u8 = 1 << 7;
+const VARINT_PAYLOAD_MASK: u8 = VARINT_CONTINUATION_BIT - 1;
+
 pub(crate) fn write_u64(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8 & 0x7f) | 0x80);
+    while value >= u64::from(VARINT_CONTINUATION_BIT) {
+        out.push((value as u8 & VARINT_PAYLOAD_MASK) | VARINT_CONTINUATION_BIT);
         value >>= 7;
     }
     out.push(value as u8);
@@ -48,42 +52,45 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn read_u8(&mut self, what: &'static str) -> Result<u8, Error> {
-        let byte = *self.input.get(self.pos).ok_or(Error::UnexpectedEof)?;
-        self.pos = self
-            .pos
-            .checked_add(1)
-            .ok_or(Error::InvalidFrame("reader position overflow"))?;
-        let _ = what;
+        let byte = *self.input.get(self.pos).ok_or(Error::UnexpectedEof(what))?;
+        self.pos += 1;
         Ok(byte)
     }
 
-    pub(crate) fn read_exact(&mut self, len: usize) -> Result<&'a [u8], Error> {
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or(Error::InvalidFrame("byte length overflow"))?;
-        let bytes = self.input.get(self.pos..end).ok_or(Error::UnexpectedEof)?;
+    pub(crate) fn read_exact(&mut self, len: usize, what: &'static str) -> Result<&'a [u8], Error> {
+        let end = self.pos + len;
+        let bytes = self
+            .input
+            .get(self.pos..end)
+            .ok_or(Error::UnexpectedEof(what))?;
         self.pos = end;
         Ok(bytes)
     }
 
-    pub(crate) fn read_u64(&mut self, _what: &'static str) -> Result<u64, Error> {
-        let mut result = 0u64;
-        for i in 0..10 {
-            let byte = self.read_u8("varint byte")?;
-            let payload = (byte & 0x7f) as u64;
-            if i == 9 && payload > 1 {
-                return Err(Error::InvalidVarint("u64 overflow"));
+    pub(crate) fn read_u64(&mut self, what: &'static str) -> Result<u64, Error> {
+        let mut value = 0u64;
+
+        for byte_index in 0..U64_VARINT_MAX_BYTES {
+            let byte = self.read_u8(what)?;
+            let payload = u64::from(byte & VARINT_PAYLOAD_MASK);
+            let shift = byte_index * 7;
+
+            if byte_index == U64_VARINT_MAX_BYTES - 1 && payload > 1 {
+                return Err(Error::InvalidVarint("varint overflows u64"));
             }
-            result |= payload << (i * 7);
-            if byte & 0x80 == 0 {
-                if i > 0 && result < (1u64 << (i * 7)) {
-                    return Err(Error::InvalidVarint("non-canonical encoding"));
-                }
-                return Ok(result);
+
+            value |= payload << shift;
+            if byte & VARINT_CONTINUATION_BIT != 0 {
+                continue;
             }
+
+            if byte_index > 0 && value < (1u64 << shift) {
+                return Err(Error::InvalidVarint("non-canonical varint"));
+            }
+            return Ok(value);
         }
-        Err(Error::InvalidVarint("more than 10 bytes"))
+
+        Err(Error::InvalidVarint("varint exceeds 10 bytes"))
     }
 
     pub(crate) fn read_usize(&mut self, what: &'static str) -> Result<usize, Error> {
