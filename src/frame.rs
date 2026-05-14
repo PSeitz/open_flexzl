@@ -651,6 +651,14 @@ fn encode_literal_side_stream_route(
             ));
         }
     }
+    if let Some(candidate) = literal_dict::build_u16_candidate(bytes) {
+        if let Some(choice) = choose_literal_dict_candidate(bytes, candidate)? {
+            return Ok(literal_dict::build_side_stream_route(
+                choice,
+                next_stream_id,
+            ));
+        }
+    }
 
     if transpose::should_try_literal_split4(bytes) {
         return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
