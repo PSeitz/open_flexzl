@@ -33,6 +33,8 @@ pub const REPRESENTATIVE_SET: &[(&str, &str)] = &[
     ("all_unique", "all_unique.uncomp"),                     // TemplateId(13).col0.uncomp
     ("clustered_wide_tail", "clustered_wide_tail.uncomp"),   // TemplateId(15).col0.uncomp
     ("mostly_unique_wide_tail", "mostly_unique_wide_tail.uncomp"), // TemplateId(39).col6.uncomp
+    ("android_v2_template_25", "android_v2_template_25.uncomp"), // representative 16 MiB chunk from moshiki Android_v2 TemplateId(25).col
+    ("android_v2_template_29", "android_v2_template_29.uncomp"), // representative 16 MiB chunk from moshiki Android_v2 TemplateId(29).col
 ];
 
 pub fn data_dir() -> PathBuf {
