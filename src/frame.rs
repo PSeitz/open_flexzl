@@ -29,7 +29,7 @@ const LITERAL_ONLY_MAX_EQUAL_VALUE_RATIO: Ratio = Ratio::new(9, 10);
 const LITERAL_ONLY_MAX_EQUAL_DELTA_RATIO: Ratio = Ratio::new(1, 2);
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
-    let chunk_count = input.len().div_ceil(MAX_CHUNK_ELEMENTS_U32);
+    let chunk_count = input.len().div_ceil(DEFAULT_CHUNK_ELEMENTS_U32);
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -40,9 +40,9 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     varint::write_usize(input.len(), &mut out);
     varint::write_usize(chunk_count, &mut out);
 
-    for chunk in input.chunks(MAX_CHUNK_ELEMENTS_U32) {
+    for chunk in input.chunks(DEFAULT_CHUNK_ELEMENTS_U32) {
         debug_assert!(!chunk.is_empty());
-        debug_assert!(chunk.len() <= MAX_CHUNK_ELEMENTS_U32);
+        debug_assert!(chunk.len() <= DEFAULT_CHUNK_ELEMENTS_U32);
         choose_and_write_best_chunk_encoding(chunk, &mut out)?;
     }
 
