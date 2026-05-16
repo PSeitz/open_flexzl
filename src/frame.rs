@@ -27,8 +27,10 @@ const LITERAL_ONLY_MIN_ELEMENTS: usize = 1024;
 const LITERAL_ONLY_MIN_EQUAL_VALUE_RATIO: Ratio = Ratio::new(1, 2);
 const LITERAL_ONLY_MAX_EQUAL_VALUE_RATIO: Ratio = Ratio::new(9, 10);
 const LITERAL_ONLY_MAX_EQUAL_DELTA_RATIO: Ratio = Ratio::new(1, 2);
-const LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS: usize = 16 * 1024;
-const LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS: usize = LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS;
+const LITERAL_DICT_ADAPTIVE_MIN_DUPLICATE_OCCURRENCES: usize = 16 * 1024;
+const LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS: usize = 16 * 1024;
+const LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS: usize =
+    256 + LITERAL_DICT_ADAPTIVE_MIN_DUPLICATE_OCCURRENCES;
 const LITERAL_DICT_REFINED_CHUNK_ELEMENTS: usize = 512 * 1024 / U32_WIDTH;
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
@@ -96,7 +98,7 @@ fn choose_adaptive_chunk_end(chunk: &[u32]) -> Option<usize> {
         if values.len() == 256 {
             let remaining = chunk.len() - index;
             return (index >= LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS
-                && remaining >= LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS)
+                && remaining >= LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS)
                 .then_some(index);
         }
 
@@ -1131,7 +1133,7 @@ mod tests {
             .map(|i| (i % 256) as u32)
             .collect();
         input.push(10_000);
-        input.extend((0..LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS).map(|i| 20_000 + i as u32));
+        input.extend((0..LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS).map(|i| 20_000 + i as u32));
 
         let ranges = choose_chunk_ranges(&input);
         assert_eq!(ranges[0], (0, LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS));
