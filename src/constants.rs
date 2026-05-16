@@ -16,11 +16,9 @@ pub(crate) const NATIVE_TRANSFORM_ID_LITERAL_DICT_U32: u64 = 1001;
 
 pub(crate) const FIELD_LZ_INPUT_COUNT: usize = 5;
 pub(crate) const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
 pub(crate) const U32_WIDTH: usize = 4;
 pub(crate) const U16_WIDTH: usize = 2;
 pub(crate) const MAX_CHUNK_ELEMENTS_U32: usize = MAX_CHUNK_BYTES / U32_WIDTH;
-pub(crate) const DEFAULT_CHUNK_ELEMENTS_U32: usize = DEFAULT_CHUNK_BYTES / U32_WIDTH;
 pub(crate) const MAX_OFFSET_ELEMENTS: usize = MAX_CHUNK_ELEMENTS_U32 - 1;
 pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 2;
 pub(crate) const DEFAULT_MIN_STREAM_SIZE: usize = 10;

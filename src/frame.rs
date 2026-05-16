@@ -27,9 +27,13 @@ const LITERAL_ONLY_MIN_ELEMENTS: usize = 1024;
 const LITERAL_ONLY_MIN_EQUAL_VALUE_RATIO: Ratio = Ratio::new(1, 2);
 const LITERAL_ONLY_MAX_EQUAL_VALUE_RATIO: Ratio = Ratio::new(9, 10);
 const LITERAL_ONLY_MAX_EQUAL_DELTA_RATIO: Ratio = Ratio::new(1, 2);
+const LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS: usize = 16 * 1024;
+const LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS: usize = LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS;
+const LITERAL_DICT_REFINED_CHUNK_ELEMENTS: usize = 512 * 1024 / U32_WIDTH;
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
-    let chunk_count = input.len().div_ceil(DEFAULT_CHUNK_ELEMENTS_U32);
+    let chunk_ranges = choose_chunk_ranges(input);
+    let chunk_count = chunk_ranges.len();
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -40,13 +44,66 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     varint::write_usize(input.len(), &mut out);
     varint::write_usize(chunk_count, &mut out);
 
-    for chunk in input.chunks(DEFAULT_CHUNK_ELEMENTS_U32) {
+    for (start, end) in chunk_ranges {
+        let chunk = &input[start..end];
         debug_assert!(!chunk.is_empty());
-        debug_assert!(chunk.len() <= DEFAULT_CHUNK_ELEMENTS_U32);
+        debug_assert!(chunk.len() <= MAX_CHUNK_ELEMENTS_U32);
         choose_and_write_best_chunk_encoding(chunk, &mut out)?;
     }
 
     Ok(out)
+}
+
+fn choose_chunk_ranges(input: &[u32]) -> Vec<(usize, usize)> {
+    // Use the full 16 MiB window by default for throughput. Only refine chunking
+    // when the first 256 distinct values cover enough input that preserving a
+    // u8 literal-dictionary chunk is likely to repay the extra chunk overhead.
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut use_refined_chunks = false;
+
+    while start < input.len() {
+        let chunk_limit = if use_refined_chunks {
+            LITERAL_DICT_REFINED_CHUNK_ELEMENTS
+        } else {
+            MAX_CHUNK_ELEMENTS_U32
+        };
+        let hard_end = input.len().min(start + chunk_limit);
+        let adaptive_end = (!use_refined_chunks)
+            .then(|| choose_adaptive_chunk_end(&input[start..hard_end]))
+            .flatten();
+        let end = adaptive_end.map_or(hard_end, |relative_end| start + relative_end);
+        debug_assert!(end > start);
+        ranges.push((start, end));
+        start = end;
+        use_refined_chunks |= adaptive_end.is_some();
+    }
+
+    ranges
+}
+
+fn choose_adaptive_chunk_end(chunk: &[u32]) -> Option<usize> {
+    // Track only the u8 dictionary boundary. A HashSet-based u16 boundary scan
+    // was too expensive for hot high-cardinality paths and did not improve the
+    // current benchmark set enough to justify applying it during chunking.
+    let mut values = Vec::<u32>::with_capacity(256);
+
+    for (index, &value) in chunk.iter().enumerate() {
+        if values.contains(&value) {
+            continue;
+        }
+
+        if values.len() == 256 {
+            let remaining = chunk.len() - index;
+            return (index >= LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS
+                && remaining >= LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS)
+                .then_some(index);
+        }
+
+        values.push(value);
+    }
+
+    None
 }
 
 pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
@@ -1066,6 +1123,39 @@ mod tests {
         let mut frame = compress_u32(&[1, 2, 1, 2]).unwrap();
         frame.push(0);
         assert!(matches!(decompress_u32(&frame), Err(Error::TrailingBytes)));
+    }
+
+    #[test]
+    fn adaptive_chunks_stop_before_u8_literal_dictionary_overflow() {
+        let mut input: Vec<u32> = (0..LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS)
+            .map(|i| (i % 256) as u32)
+            .collect();
+        input.push(10_000);
+        input.extend((0..LITERAL_DICT_ADAPTIVE_MIN_REPEATED_ELEMENTS).map(|i| 20_000 + i as u32));
+
+        let ranges = choose_chunk_ranges(&input);
+        assert_eq!(ranges[0], (0, LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS));
+        assert_eq!(
+            decompress_u32(&compress_u32(&input).unwrap()).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn adaptive_chunks_do_not_split_tiny_high_cardinality_prefixes() {
+        let input: Vec<u32> = (0..1024).collect();
+        assert_eq!(choose_chunk_ranges(&input), vec![(0, input.len())]);
+    }
+
+    #[test]
+    fn adaptive_chunks_do_not_split_before_a_tiny_tail() {
+        let mut input: Vec<u32> = (0..LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS)
+            .map(|i| (i % 256) as u32)
+            .collect();
+        input.push(10_000);
+        input.extend((0..1024).map(|i| 20_000 + i as u32));
+
+        assert_eq!(choose_chunk_ranges(&input), vec![(0, input.len())]);
     }
 
     #[test]
