@@ -13,6 +13,9 @@ use crate::frame::{SideStreamRoute, StoredStreamRecord, TransformRecord};
 use crate::varint;
 use crate::Error;
 
+const U16_EARLY_CHECK_DISTINCT_VALUES: usize = 32 * 1024;
+const U16_EARLY_CHECK_MIN_DUPLICATE_OCCURRENCES: usize = U16_EARLY_CHECK_DISTINCT_VALUES / 2;
+
 /// Encoder-side dictionary candidate for a complete `u32` literal byte stream.
 pub(crate) struct LiteralDictCandidate {
     /// Encounter-order dictionary table, stored as little-endian unique `u32`
@@ -96,33 +99,65 @@ pub(crate) fn build_side_stream_route(
 ///
 /// Returns `None` when the stream is not a complete `u32` stream, is too small
 /// to plausibly amortize the transform/table overhead, or has more than 256
-/// distinct values. The decoder supports both one- and two-byte code streams,
-/// but the first encoder route deliberately targets the strongest low-cardinality
-/// case from the plan.
+/// distinct values.
 pub(crate) fn build_u8_candidate(bytes: &[u8]) -> Option<LiteralDictCandidate> {
+    build_candidate(
+        bytes,
+        u8::MAX as usize + 1,
+        1,
+        |_, _| true,
+        |index, dict_ord| {
+            dict_ord.push(index as u8);
+        },
+    )
+}
+
+/// Build an encounter-order dictionary using two-byte little-endian codes.
+pub(crate) fn build_u16_candidate(bytes: &[u8]) -> Option<LiteralDictCandidate> {
+    build_candidate(
+        bytes,
+        u16::MAX as usize + 1,
+        2,
+        u16_candidate_should_continue,
+        |index, dict_ord| {
+            dict_ord.extend_from_slice(&(index as u16).to_le_bytes());
+        },
+    )
+}
+
+fn build_candidate(
+    bytes: &[u8],
+    max_values: usize,
+    code_width: usize,
+    should_continue: impl Fn(usize, usize) -> bool,
+    mut push_code: impl FnMut(usize, &mut Vec<u8>),
+) -> Option<LiteralDictCandidate> {
     if bytes.len() < 256 || !bytes.len().is_multiple_of(U32_WIDTH) {
         return None;
     }
 
     let element_count = bytes.len() / U32_WIDTH;
-    let mut val_to_dict_ord = FxHashMap::<u32, u8>::default();
+    let mut val_to_dict_ord = FxHashMap::<u32, usize>::default();
     let mut values = Vec::<u32>::new();
-    let mut dict_ord = Vec::with_capacity(element_count);
+    let mut dict_ord = Vec::with_capacity(element_count * code_width);
 
-    for chunk in bytes.chunks_exact(U32_WIDTH) {
+    for (element_index, chunk) in bytes.chunks_exact(U32_WIDTH).enumerate() {
         let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let index = if let Some(&index) = val_to_dict_ord.get(&value) {
             index
         } else {
-            if values.len() == 256 {
+            if values.len() == max_values {
                 return None;
             }
-            let index = values.len() as u8;
+            let index = values.len();
             values.push(value);
             val_to_dict_ord.insert(value, index);
+            if !should_continue(element_index + 1, values.len()) {
+                return None;
+            }
             index
         };
-        dict_ord.push(index);
+        push_code(index, &mut dict_ord);
     }
 
     // A dictionary with no repetition is just table + codes overhead. Require a
@@ -131,16 +166,22 @@ pub(crate) fn build_u8_candidate(bytes: &[u8]) -> Option<LiteralDictCandidate> {
         return None;
     }
 
-    let mut value_bytes = Vec::with_capacity(values.len() * U32_WIDTH);
-    for value in values {
-        value_bytes.extend_from_slice(&value.to_le_bytes());
-    }
+    let value_bytes = values.into_iter().flat_map(u32::to_le_bytes).collect();
 
     Some(LiteralDictCandidate {
         value_bytes,
         dict_ord,
-        code_width: 1,
+        code_width,
     })
+}
+
+fn u16_candidate_should_continue(element_count: usize, distinct_values: usize) -> bool {
+    if distinct_values != U16_EARLY_CHECK_DISTINCT_VALUES {
+        return true;
+    }
+
+    let duplicate_occurrences = element_count - distinct_values;
+    duplicate_occurrences >= U16_EARLY_CHECK_MIN_DUPLICATE_OCCURRENCES
 }
 
 pub(crate) fn decode(
@@ -179,25 +220,16 @@ pub(crate) fn decode(
         Error::InvalidTransform("literal_dict_u32 output length overflow"),
     )?);
 
-    match code_width {
-        1 => {
-            for &code in dict_ord {
-                let value = *table.get(code as usize).ok_or(Error::InvalidTransform(
-                    "literal_dict_u32 code is out of dictionary range",
-                ))?;
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        2 => {
-            for chunk in dict_ord.chunks_exact(U16_WIDTH) {
-                let code = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
-                let value = *table.get(code).ok_or(Error::InvalidTransform(
-                    "literal_dict_u32 code is out of dictionary range",
-                ))?;
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        _ => unreachable!(),
+    for chunk in dict_ord.chunks_exact(code_width) {
+        let code = match code_width {
+            1 => chunk[0] as usize,
+            2 => u16::from_le_bytes([chunk[0], chunk[1]]) as usize,
+            _ => unreachable!(),
+        };
+        let value = *table.get(code).ok_or(Error::InvalidTransform(
+            "literal_dict_u32 code is out of dictionary range",
+        ))?;
+        out.extend_from_slice(&value.to_le_bytes());
     }
 
     Ok(out)
@@ -221,6 +253,50 @@ mod tests {
             decode(&candidate.value_bytes, &candidate.dict_ord, 1).unwrap(),
             bytes
         );
+    }
+
+    #[test]
+    fn u16_candidate_round_trips() {
+        let values: Vec<u32> = (0..1_024).map(|i| (i % 300) as u32).collect();
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let candidate = build_u16_candidate(&bytes).unwrap();
+        assert_eq!(candidate.code_width, 2);
+        assert_eq!(
+            decode(&candidate.value_bytes, &candidate.dict_ord, 2).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn u16_candidate_aborts_at_midpoint_without_enough_duplicates() {
+        let values: Vec<u32> = (0..U16_EARLY_CHECK_DISTINCT_VALUES as u32).collect();
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        assert!(build_u16_candidate(&bytes).is_none());
+    }
+
+    #[test]
+    fn u16_candidate_continues_at_midpoint_with_enough_duplicates() {
+        let mut values = Vec::new();
+        for value in 0..U16_EARLY_CHECK_DISTINCT_VALUES as u32 {
+            values.push(value);
+            if value < U16_EARLY_CHECK_MIN_DUPLICATE_OCCURRENCES as u32 {
+                values.push(value);
+            }
+        }
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        assert!(build_u16_candidate(&bytes).is_some());
     }
 
     #[test]

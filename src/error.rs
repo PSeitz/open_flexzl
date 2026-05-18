@@ -3,8 +3,8 @@ use thiserror::Error as ThisError;
 /// Errors returned by the `open_flexzl` encoder and decoder.
 #[derive(Debug, ThisError)]
 pub enum Error {
-    #[error("unexpected end of input")]
-    UnexpectedEof,
+    #[error("unexpected end of input while reading {0}")]
+    UnexpectedEof(&'static str),
 
     #[error("trailing bytes after final chunk")]
     TrailingBytes,

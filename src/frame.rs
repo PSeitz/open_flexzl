@@ -27,9 +27,15 @@ const LITERAL_ONLY_MIN_ELEMENTS: usize = 1024;
 const LITERAL_ONLY_MIN_EQUAL_VALUE_RATIO: Ratio = Ratio::new(1, 2);
 const LITERAL_ONLY_MAX_EQUAL_VALUE_RATIO: Ratio = Ratio::new(9, 10);
 const LITERAL_ONLY_MAX_EQUAL_DELTA_RATIO: Ratio = Ratio::new(1, 2);
+const LITERAL_DICT_ADAPTIVE_MIN_DUPLICATE_OCCURRENCES: usize = 16 * 1024;
+const LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS: usize = 16 * 1024;
+const LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS: usize =
+    256 + LITERAL_DICT_ADAPTIVE_MIN_DUPLICATE_OCCURRENCES;
+const LITERAL_DICT_REFINED_CHUNK_ELEMENTS: usize = 512 * 1024 / U32_WIDTH;
 
 pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
-    let chunk_count = input.len().div_ceil(MAX_CHUNK_ELEMENTS_U32);
+    let chunk_ranges = choose_chunk_ranges(input);
+    let chunk_count = chunk_ranges.len();
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -40,7 +46,8 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     varint::write_usize(input.len(), &mut out);
     varint::write_usize(chunk_count, &mut out);
 
-    for chunk in input.chunks(MAX_CHUNK_ELEMENTS_U32) {
+    for (start, end) in chunk_ranges {
+        let chunk = &input[start..end];
         debug_assert!(!chunk.is_empty());
         debug_assert!(chunk.len() <= MAX_CHUNK_ELEMENTS_U32);
         choose_and_write_best_chunk_encoding(chunk, &mut out)?;
@@ -49,9 +56,61 @@ pub(crate) fn compress_u32(input: &[u32]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+fn choose_chunk_ranges(input: &[u32]) -> Vec<(usize, usize)> {
+    // Use the full 16 MiB window by default for throughput. Only refine chunking
+    // when the first 256 distinct values cover enough input that preserving a
+    // u8 literal-dictionary chunk is likely to repay the extra chunk overhead.
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut use_refined_chunks = false;
+
+    while start < input.len() {
+        let chunk_limit = if use_refined_chunks {
+            LITERAL_DICT_REFINED_CHUNK_ELEMENTS
+        } else {
+            MAX_CHUNK_ELEMENTS_U32
+        };
+        let hard_end = input.len().min(start + chunk_limit);
+        let adaptive_end = (!use_refined_chunks)
+            .then(|| choose_adaptive_chunk_end(&input[start..hard_end]))
+            .flatten();
+        let end = adaptive_end.map_or(hard_end, |relative_end| start + relative_end);
+        debug_assert!(end > start);
+        ranges.push((start, end));
+        start = end;
+        use_refined_chunks |= adaptive_end.is_some();
+    }
+
+    ranges
+}
+
+fn choose_adaptive_chunk_end(chunk: &[u32]) -> Option<usize> {
+    // Track only the u8 dictionary boundary. A HashSet-based u16 boundary scan
+    // was too expensive for hot high-cardinality paths and did not improve the
+    // current benchmark set enough to justify applying it during chunking.
+    let mut values = Vec::<u32>::with_capacity(256);
+
+    for (index, &value) in chunk.iter().enumerate() {
+        if values.contains(&value) {
+            continue;
+        }
+
+        if values.len() == 256 {
+            let remaining = chunk.len() - index;
+            return (index >= LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS
+                && remaining >= LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS)
+                .then_some(index);
+        }
+
+        values.push(value);
+    }
+
+    None
+}
+
 pub(crate) fn decompress_u32(input: &[u8]) -> Result<Vec<u32>, Error> {
     let mut reader = Reader::new(input);
-    if reader.read_exact(MAGIC.len())? != MAGIC {
+    if reader.read_exact(MAGIC.len(), "magic")? != MAGIC {
         return Err(Error::InvalidFrame("bad magic"));
     }
     if reader.read_u8("version")? != VERSION_V1 {
@@ -230,7 +289,9 @@ fn decode_chunk_encoding(reader: &mut Reader<'_>) -> Result<Vec<u32>, Error> {
             return Err(Error::InvalidMap("stream slot defined more than once"));
         }
         let byte_len = reader.read_usize("stored stream byte length")?;
-        let payload = reader.read_exact(byte_len)?.to_vec();
+        let payload = reader
+            .read_exact(byte_len, "stored stream payload")?
+            .to_vec();
         slots[stream_id].bytes = Some(payload);
     }
 
@@ -315,7 +376,12 @@ fn read_and_execute_transform_record(
     let mut inputs = Vec::with_capacity(input_count);
     for _ in 0..input_count {
         let stream_id = reader.read_usize("input stream id")?;
-        validate_transform_input_stream_id(stream_id, slots)?;
+        if stream_id >= slots.len() {
+            return Err(Error::InvalidMap("transform input id is out of range"));
+        }
+        if slots[stream_id].bytes.is_none() {
+            return Err(Error::InvalidMap("transform input stream is undefined"));
+        }
         inputs.push(stream_id);
     }
 
@@ -339,7 +405,9 @@ fn read_and_execute_transform_record(
     }
 
     let private_header_len = reader.read_usize("private_header_len")?;
-    let private_header = reader.read_exact(private_header_len)?.to_vec();
+    let private_header = reader
+        .read_exact(private_header_len, "transform private header")?
+        .to_vec();
 
     for &input in &inputs {
         slots[input].used = true;
@@ -563,16 +631,6 @@ fn execute_field_lz_transform(
     })
 }
 
-fn validate_transform_input_stream_id(stream_id: usize, slots: &[StreamSlot]) -> Result<(), Error> {
-    if stream_id >= slots.len() {
-        return Err(Error::InvalidMap("transform input id is out of range"));
-    }
-    if slots[stream_id].bytes.is_none() {
-        return Err(Error::InvalidMap("transform input stream is undefined"));
-    }
-    Ok(())
-}
-
 fn build_field_lz_side_stream_graph(
     streams: &FieldLzSideStreams,
     chunk_num_elements: usize,
@@ -652,6 +710,14 @@ fn encode_literal_side_stream_route(
             ));
         }
     }
+    if let Some(candidate) = literal_dict::build_u16_candidate(bytes) {
+        if let Some(choice) = choose_literal_dict_candidate(bytes, candidate)? {
+            return Ok(literal_dict::build_side_stream_route(
+                choice,
+                next_stream_id,
+            ));
+        }
+    }
 
     if transpose::should_try_literal_split4(bytes) {
         return build_transposed_literal_side_stream_candidate(bytes, next_stream_id);
@@ -710,17 +776,14 @@ fn estimated_raw_side_stream_route_payload_len(bytes: &[u8]) -> Result<usize, Er
 fn encode_side_stream_payload(
     bytes: &[u8],
 ) -> Result<literal_dict::EncodedSideStreamPayload, Error> {
-    if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
-        Ok(literal_dict::EncodedSideStreamPayload {
-            payload: bytes.to_vec(),
-            is_zstd: false,
-        })
+    let is_zstd = bytes.len() >= DEFAULT_MIN_STREAM_SIZE;
+    let payload = if is_zstd {
+        zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?
     } else {
-        Ok(literal_dict::EncodedSideStreamPayload {
-            payload: zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?,
-            is_zstd: true,
-        })
-    }
+        bytes.to_vec()
+    };
+
+    Ok(literal_dict::EncodedSideStreamPayload { payload, is_zstd })
 }
 
 fn encode_raw_side_stream_route(
@@ -728,36 +791,31 @@ fn encode_raw_side_stream_route(
     element_width: usize,
     next_stream_id: usize,
 ) -> Result<SideStreamRoute, Error> {
-    if bytes.len() < DEFAULT_MIN_STREAM_SIZE {
-        let stream_id = next_stream_id;
-        return Ok(SideStreamRoute {
-            stored_streams: vec![StoredStreamRecord {
-                stream_id,
-                payload: bytes.to_vec(),
-            }],
-            transforms: Vec::new(),
-            output_stream_id: stream_id,
-            next_stream_id: next_stream_id + 1,
-        });
-    }
-
+    let encoded = encode_side_stream_payload(bytes)?;
     let stored_id = next_stream_id;
-    let decoded_id = next_stream_id + 1;
-    let payload = zstd_codec::encode_magicless(bytes, DEFAULT_COMPRESSION_LEVEL)?;
-    Ok(SideStreamRoute {
+    let mut route = SideStreamRoute {
         stored_streams: vec![StoredStreamRecord {
             stream_id: stored_id,
-            payload,
+            payload: encoded.payload,
         }],
-        transforms: vec![TransformRecord {
+        transforms: Vec::new(),
+        output_stream_id: stored_id,
+        next_stream_id: next_stream_id + 1,
+    };
+
+    if encoded.is_zstd {
+        let decoded_id = route.next_stream_id;
+        route.transforms.push(TransformRecord {
             transform_id: STANDARD_TRANSFORM_ID_ZSTD,
             inputs: vec![stored_id],
             outputs: vec![decoded_id],
             private_header: varint::encode_u64(element_width as u64),
-        }],
-        output_stream_id: decoded_id,
-        next_stream_id: next_stream_id + 2,
-    })
+        });
+        route.output_stream_id = decoded_id;
+        route.next_stream_id += 1;
+    }
+
+    Ok(route)
 }
 
 fn build_transposed_literal_side_stream_candidate(
@@ -1067,6 +1125,39 @@ mod tests {
         let mut frame = compress_u32(&[1, 2, 1, 2]).unwrap();
         frame.push(0);
         assert!(matches!(decompress_u32(&frame), Err(Error::TrailingBytes)));
+    }
+
+    #[test]
+    fn adaptive_chunks_stop_before_u8_literal_dictionary_overflow() {
+        let mut input: Vec<u32> = (0..LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS)
+            .map(|i| (i % 256) as u32)
+            .collect();
+        input.push(10_000);
+        input.extend((0..LITERAL_DICT_ADAPTIVE_MIN_TAIL_ELEMENTS).map(|i| 20_000 + i as u32));
+
+        let ranges = choose_chunk_ranges(&input);
+        assert_eq!(ranges[0], (0, LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS));
+        assert_eq!(
+            decompress_u32(&compress_u32(&input).unwrap()).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn adaptive_chunks_do_not_split_tiny_high_cardinality_prefixes() {
+        let input: Vec<u32> = (0..1024).collect();
+        assert_eq!(choose_chunk_ranges(&input), vec![(0, input.len())]);
+    }
+
+    #[test]
+    fn adaptive_chunks_do_not_split_before_a_tiny_tail() {
+        let mut input: Vec<u32> = (0..LITERAL_DICT_U8_ADAPTIVE_MIN_ELEMENTS)
+            .map(|i| (i % 256) as u32)
+            .collect();
+        input.push(10_000);
+        input.extend((0..1024).map(|i| 20_000 + i as u32));
+
+        assert_eq!(choose_chunk_ranges(&input), vec![(0, input.len())]);
     }
 
     #[test]

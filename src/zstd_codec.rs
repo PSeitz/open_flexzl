@@ -8,7 +8,9 @@
 use std::io::Write;
 use std::mem::MaybeUninit;
 
-use crate::Error;
+use zstd::zstd_safe::{CONTENTSIZE_ERROR, CONTENTSIZE_UNKNOWN};
+
+use crate::{constants::MAX_CHUNK_BYTES, Error};
 
 pub(crate) fn encode_magicless(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     let pledged_size = u64::try_from(src.len())
@@ -41,6 +43,11 @@ pub(crate) fn decode_magicless(src: &[u8], output_elt_width: usize) -> Result<Ve
     let content_size = magicless_content_size(src)?;
     let output_len = usize::try_from(content_size)
         .map_err(|_| Error::LimitExceeded("zstd content size does not fit usize"))?;
+    if output_len > MAX_CHUNK_BYTES {
+        return Err(Error::LimitExceeded(
+            "zstd content size exceeds chunk byte limit",
+        ));
+    }
     if output_len % output_elt_width != 0 {
         return Err(Error::InvalidTransform(
             "zstd content size is not a multiple of output element width",
@@ -79,22 +86,19 @@ pub(crate) fn magicless_content_size(src: &[u8]) -> Result<u64, Error> {
         return Err(Error::zstd_code(code));
     }
     if code != 0 {
-        return Err(Error::UnexpectedEof);
+        return Err(Error::UnexpectedEof("zstd frame header"));
     }
 
     let header = unsafe { header.assume_init() };
-    let content_size = header.frameContentSize;
-    if content_size == zstd::zstd_safe::CONTENTSIZE_UNKNOWN {
-        return Err(Error::InvalidTransform(
+    match header.frameContentSize {
+        CONTENTSIZE_UNKNOWN => Err(Error::InvalidTransform(
             "zstd frame content size is not present",
-        ));
-    }
-    if content_size == zstd::zstd_safe::CONTENTSIZE_ERROR {
-        return Err(Error::InvalidTransform(
+        )),
+        CONTENTSIZE_ERROR => Err(Error::InvalidTransform(
             "zstd frame content size is invalid",
-        ));
+        )),
+        content_size => Ok(content_size),
     }
-    Ok(content_size)
 }
 
 #[cfg(test)]
@@ -112,5 +116,17 @@ mod tests {
             );
             assert_eq!(decode_magicless(&compressed, 1).unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decode_rejects_content_size_above_chunk_limit() {
+        let oversized = vec![0; MAX_CHUNK_BYTES + 1];
+        let compressed = encode_magicless(&oversized, 1).unwrap();
+        assert!(matches!(
+            decode_magicless(&compressed, 1),
+            Err(Error::LimitExceeded(
+                "zstd content size exceeds chunk byte limit"
+            ))
+        ));
     }
 }
